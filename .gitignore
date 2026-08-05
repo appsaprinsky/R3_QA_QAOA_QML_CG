@@ -5,7 +5,7 @@ __pycache__/
 almrrc2021-data-training/
 # C extensions
 *.so
-
+.DS_Store
 # Distribution / packaging
 .Python
 build/
