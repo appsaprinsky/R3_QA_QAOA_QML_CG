@@ -1,10 +1,10 @@
 """
-algo_hybrid_2_5.py
+algo_hybrid_LRWSQAOA.py
 
 Algorithm Hybrid 2+5: Spatial Rolling WS-LR QAOA with Stochastic Exploration &
 Receding-Horizon Batch Commitment + LNS (Open TSP).
 
-Contains a real quantum statevector QAOA simulator for local sub-tour optimization:
+Contains full quantum statevector QAOA simulator for local sub-tour optimization:
 1. Continuous LP Relaxation warm-start angle calculation (WS-LR).
 2. QUBO -> Ising Hamiltonian mapping for positional TSP encoding.
 3. Parameterized QAOA Quantum Circuit (Cost Phase + WS-X or XY Mixer Phase).
@@ -28,7 +28,7 @@ except ImportError:
 
 
 # =====================================================================
-# 1. Real Warm-Start QAOA Engine
+# 1. Warm-Start QAOA Engine
 # =====================================================================
 
 
@@ -45,9 +45,7 @@ def _solve_lp_relaxation(curr_node, candidates, matrix):
         for i in range(k):
             for j in range(k):
                 if i != j:
-                    c[i * k + t] += (
-                        0.5 * matrix[candidates[i], candidates[j]]
-                    )  # relaxed approximation
+                    c[i * k + t] += 0.5 * matrix[candidates[i], candidates[j]]
 
     # Equality constraints: sum_t x_{i,t} = 1, sum_i x_{i,t} = 1
     A_eq = []
@@ -74,7 +72,6 @@ def _solve_lp_relaxation(curr_node, candidates, matrix):
     else:
         x_lp = np.full(n_vars, 1.0 / k)
 
-    # Clip to avoid zero-division in quantum phase angles
     eps = 1e-4
     return np.clip(x_lp, eps, 1.0 - eps)
 
@@ -128,13 +125,8 @@ def _qubo_energy(bitstring, Q):
 def _qaoa_statevector_simulation(
     Q, x_lp, p=1, xy_mixer=False, num_steps=30
 ):
-    """
-    Executes variational QAOA statevector simulation.
-    Constructs quantum circuit, computes expectation values, and returns optimal bitstring.
-    """
+    """Executes variational QAOA statevector simulation via Qiskit or fallback."""
     n_qubits = len(x_lp)
-
-    # Initial state angles for warm start: theta_i = 2 * arcsin(sqrt(x_i^*))
     thetas = 2.0 * np.arcsin(np.sqrt(x_lp))
 
     def build_circuit(params):
@@ -143,7 +135,6 @@ def _qaoa_statevector_simulation(
 
         if HAS_QISKIT:
             qc = QuantumCircuit(n_qubits)
-            # 1. Warm-Start Initial State Preparation: R_y(theta) |0>
             for i in range(n_qubits):
                 qc.ry(thetas[i], i)
 
@@ -151,7 +142,6 @@ def _qaoa_statevector_simulation(
                 gamma = gammas[layer]
                 beta = betas[layer]
 
-                # 2. Cost Hamiltonian Phase Separator: exp(-i * gamma * H_C)
                 for i in range(n_qubits):
                     if Q[i, i] != 0:
                         qc.rz(2.0 * gamma * Q[i, i], i)
@@ -161,29 +151,25 @@ def _qaoa_statevector_simulation(
                         if coeff != 0:
                             qc.rzz(gamma * coeff, i, j)
 
-                # 3. Mixer Phase Operator: exp(-i * beta * H_M)
                 if xy_mixer:
-                    # XY-mixer on adjacent qubit pairs (preserves excitation subspace)
                     for i in range(n_qubits - 1):
                         qc.rxx(beta, i, i + 1)
                         qc.ryy(beta, i, i + 1)
                 else:
-                    # Warm-Started Pauli-X Mixer
                     for i in range(n_qubits):
                         qc.ry(-thetas[i], i)
                         qc.rx(2.0 * beta, i)
                         qc.ry(thetas[i], i)
 
             return qc
+        return None
 
-    # Objective function for classical COBYLA optimizer
     def objective(params):
         if HAS_QISKIT:
             qc = build_circuit(params)
             sv = Statevector.from_instruction(qc)
             probs = sv.probabilities()
 
-            # Compute expectation value <H_C>
             energy = 0.0
             for idx, prob in enumerate(probs):
                 if prob > 1e-6:
@@ -192,55 +178,44 @@ def _qaoa_statevector_simulation(
             return energy
         return 0.0
 
-    # Initial parameter guess
     init_params = np.array([0.1] * p + [0.5] * p)
 
-    # Run classical optimizer over quantum statevector
-    res = minimize(objective, init_params, method="COBYLA", options={"maxiter": num_steps})
+    if HAS_QISKIT:
+        res = minimize(objective, init_params, method="COBYLA", options={"maxiter": num_steps})
+        optimal_qc = build_circuit(res.x)
+        sv = Statevector.from_instruction(optimal_qc)
+        probs = sv.probabilities()
 
-    # Sample best bitstring from optimized circuit statevector
-    optimal_qc = build_circuit(res.x)
-    sv = Statevector.from_instruction(optimal_qc)
-    probs = sv.probabilities()
+        best_bitstr = None
+        min_e = float("inf")
 
-    best_bitstr = None
-    min_e = float("inf")
+        for idx, prob in enumerate(probs):
+            if prob > 1e-8:
+                bitstr = [int(b) for b in format(idx, f"0{n_qubits}b")[::-1]]
+                e = _qubo_energy(bitstr, Q)
+                if e < min_e:
+                    min_e = e
+                    best_bitstr = bitstr
 
-    for idx, prob in enumerate(probs):
-        if prob > 1e-8:
-            bitstr = [int(b) for b in format(idx, f"0{n_qubits}b")[::-1]]
-            e = _qubo_energy(bitstr, Q)
-            if e < min_e:
-                min_e = e
-                best_bitstr = bitstr
+        return best_bitstr
 
-    return best_bitstr
+    return None
 
 
 def solve_wslr_qaoa_subtour(
     curr_node, candidate_nodes, matrix, xy_mixer=False, p_layers=1
 ):
-    """
-    Formulates Open TSP QUBO for candidates, warm-starts via LP relaxation,
-    executes QAOA statevector simulation, and decodes optimal sequence.
-    """
+    """Formulates Open TSP QUBO, solves QAOA simulation, and decodes sequence."""
     k = len(candidate_nodes)
     if k <= 1:
         return list(candidate_nodes)
 
-    # 1. Warm-Start Angle Generation (Continuous Linear Relaxation)
     x_lp = _solve_lp_relaxation(curr_node, candidate_nodes, matrix)
-
-    # 2. QUBO Matrix Formulation
     Q = _build_qubo_matrix(curr_node, candidate_nodes, matrix)
-
-    # 3. QAOA Simulation Execution
     bitstring = _qaoa_statevector_simulation(
         Q, x_lp, p=p_layers, xy_mixer=xy_mixer
     )
 
-    # 4. Decode Bitstring -> Permutation Sequence
-    # bitstring layout: x_{i, t} at index (i * k + t)
     selected_tour = []
     used_candidates = set()
 
@@ -255,7 +230,7 @@ def solve_wslr_qaoa_subtour(
                     best_cand = i
 
         if best_cand is None:
-            remaining = list(set(range(k)) - used_candidates)
+            remaining = sorted(list(set(range(k)) - used_candidates))
             best_cand = remaining[0]
 
         used_candidates.add(best_cand)
@@ -278,28 +253,8 @@ def run_algo_hybrid_2_5(
     seed=None,
 ):
     """
-    Executes Hybrid Algo 2+5 combining spatial windowing, WS-LR QAOA quantum
-    simulation, stochastic exploration, and receding-horizon batch commitment.
-
-    Parameters
-    ----------
-    data : dict
-        Contains 'matrix' (N x N array), 'n_nodes' (int), 'depot_idx' (int, optional).
-    qubit_count : int, optional (default=5)
-        Number of candidate node slots evaluated per quantum window (k <= qubit_count).
-    exploration_percent : float, optional (default=0.0)
-        Percentage (0.0 to 1.0) of candidate slots allocated to non-nearest exploration nodes.
-    batch_count : int, optional (default=1)
-        Number of steps committed from the QAOA subtour solution before re-evaluating (1 <= batch_count <= qubit_count).
-    xy_mixer : bool, optional (default=False)
-        Enables XY-mixer topology for QAOA circuit formulation.
-    seed : int, optional
-        Random seed for stochastic exploration reproducibility.
-
-    Returns
-    -------
-    dict
-        Result dictionary containing 'algo', 'tour', 'cost', and 'params'.
+    Executes Hybrid Algo 2+5 with strict candidate routing.
+    Guarantees zero exploration when exploration_percent == 0.0.
     """
     if seed is not None:
         random.seed(seed)
@@ -309,7 +264,6 @@ def run_algo_hybrid_2_5(
     n = data["n_nodes"]
     depot_idx = data.get("depot_idx", 0)
 
-    # Bound and sanitize variables
     qubit_count = max(1, qubit_count)
     batch_count = max(1, min(batch_count, qubit_count))
     exploration_percent = max(0.0, min(1.0, exploration_percent))
@@ -318,15 +272,21 @@ def run_algo_hybrid_2_5(
     curr = depot_idx
     unvisited = set(range(n)) - {depot_idx}
 
-    # 1. QAOA Receding-Horizon Construction Phase
     while unvisited:
         k_batch = min(qubit_count, len(unvisited))
 
-        n_explore = int(round(k_batch * exploration_percent))
-        n_explore = min(n_explore, k_batch - 1) if k_batch > 1 else 0
-        n_nearest = k_batch - n_explore
+        # Strict exploration budget allocation
+        if exploration_percent <= 0.0:
+            n_explore = 0
+            n_nearest = k_batch
+        else:
+            n_explore = int(math.floor(k_batch * exploration_percent))
+            if k_batch > 1 and n_explore >= k_batch:
+                n_explore = k_batch - 1
+            n_nearest = k_batch - n_explore
 
-        sorted_unvisited = sorted(list(unvisited), key=lambda x: matrix[curr, x])
+        # Deterministic sorting by distance, broken by node index
+        sorted_unvisited = sorted(list(unvisited), key=lambda x: (matrix[curr, x], x))
         nearest_candidates = sorted_unvisited[:n_nearest]
 
         remaining_unvisited = sorted_unvisited[n_nearest:]
@@ -339,12 +299,10 @@ def run_algo_hybrid_2_5(
 
         candidate_nodes = nearest_candidates + exploration_candidates
 
-        # Solve sub-tour using real QAOA Quantum Statevector Simulator
         qaoa_subtour = solve_wslr_qaoa_subtour(
             curr, candidate_nodes, matrix, xy_mixer=xy_mixer
         )
 
-        # Commit up to `batch_count` nodes from the QAOA solution
         commit_depth = min(batch_count, len(qaoa_subtour))
         nodes_to_commit = qaoa_subtour[:commit_depth]
 
@@ -353,7 +311,7 @@ def run_algo_hybrid_2_5(
             unvisited.remove(node)
         curr = nodes_to_commit[-1]
 
-    # 2. Open TSP 2-Opt Local Search (LNS) Post-Processing
+    # Open TSP 2-Opt Local Search (LNS)
     improved = True
     max_iter = 100
     iter_cnt = 0

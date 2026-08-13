@@ -206,5 +206,5 @@ def visualize_stepwise_execution(
 if __name__ == "__main__":
     data = generate_random_tsp_data(n_nodes=12, seed=101)
     visualize_stepwise_execution(
-        data, qubit_count=4, exploration_percent=0.25, batch_count=2, xy_mixer=False
+        data, qubit_count=4, exploration_percent=0.0, batch_count=4, xy_mixer=False
     )

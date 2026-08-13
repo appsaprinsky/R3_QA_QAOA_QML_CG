@@ -5,9 +5,7 @@ Comparative analysis script between Amazon Planned Route baseline and
 Hybrid Algorithm 2+5 (WS-LR QAOA + LNS) using the real Amazon Last Mile
 Routing Research Challenge dataset parsed via AmazonDataLoader.
 
-Visualizes and evaluates both:
-1. Open TSP (Without Depot)
-2. Closed TSP (With Depot)
+Evaluates Open TSP (Without Depot Return).
 """
 
 # --- CRITICAL CPU & THERMAL LIMITS ---
@@ -19,6 +17,8 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
 os.environ["NUMEXPR_NUM_THREADS"] = "2"
 
 import gc
+import math
+import random
 import time
 import numpy as np
 
@@ -71,22 +71,23 @@ def get_real_amazon_delivery_dataset(data_dir="./almrrc2021-data-training", rout
     }
 
 
-def compute_route_costs(tour, matrix):
-    """Calculates both Open (without depot return) and Closed (with depot return) costs."""
-    open_cost = sum(matrix[tour[i], tour[i + 1]] for i in range(len(tour) - 1))
-    closed_cost = open_cost + matrix[tour[-1], tour[0]]
-    return float(open_cost), float(closed_cost)
+def compute_open_route_cost(tour, matrix):
+    """Calculates Open TSP cost (accumulated travel cost along sequence without return to depot)."""
+    return float(sum(matrix[tour[i], tour[i + 1]] for i in range(len(tour) - 1)))
 
 
 def visualize_stepwise_execution(
     data,
     qubit_count=4,
-    exploration_percent=0.20,
-    batch_count=2,
+    exploration_percent=0.0,
+    batch_count=1,
     xy_mixer=False,
     output_dir="qaoa_visualizations",
 ):
-    """Executes Hybrid 2+5 step-by-step on real Amazon dataset without plotting the distant depot."""
+    """
+    Executes Hybrid 2+5 step-by-step on real Amazon dataset (excluding depot from visuals).
+    Enforces strict zero exploration when exploration_percent == 0.0.
+    """
     os.makedirs(output_dir, exist_ok=True)
 
     coords = data["coords"]
@@ -104,21 +105,32 @@ def visualize_stepwise_execution(
     step_counter = 1
     t_start = time.time()
 
-    print(f"=== Starting Step-by-Step Visualization Execution (Qubits={qubit_count}, Real Data: {data['route_id']}) ===")
+    print(
+        f"=== Starting Step-by-Step Visualization Execution "
+        f"(Qubits={qubit_count}, Exp={exploration_percent*100:.0f}%, Batch={batch_count}, "
+        f"Route: {data['route_id']}) ==="
+    )
 
     while unvisited:
         step_t0 = time.time()
         k_batch = min(qubit_count, len(unvisited))
-        n_explore = int(round(k_batch * exploration_percent))
-        n_explore = min(n_explore, k_batch - 1) if k_batch > 1 else 0
-        n_nearest = k_batch - n_explore
 
-        sorted_unvisited = sorted(list(unvisited), key=lambda x: matrix[curr, x])
+        # Strict exploration budget allocation
+        if exploration_percent <= 0.0:
+            n_explore = 0
+            n_nearest = k_batch
+        else:
+            n_explore = int(math.floor(k_batch * exploration_percent))
+            if k_batch > 1 and n_explore >= k_batch:
+                n_explore = k_batch - 1
+            n_nearest = k_batch - n_explore
+
+        # Deterministic sorting by travel cost, broken by node index
+        sorted_unvisited = sorted(list(unvisited), key=lambda x: (matrix[curr, x], x))
         nearest_candidates = sorted_unvisited[:n_nearest]
 
         remaining_unvisited = sorted_unvisited[n_nearest:]
         if n_explore > 0 and remaining_unvisited:
-            import random
             exploration_candidates = random.sample(
                 remaining_unvisited, min(n_explore, len(remaining_unvisited))
             )
@@ -242,7 +254,13 @@ def visualize_stepwise_execution(
     print(f"--> Step visualizations saved to '{output_dir}/' in {time.time()-t_start:.2f}s\n")
 
 
-def run_comparative_benchmark(visualise_step_by_step: bool = True):
+def run_comparative_benchmark(
+    qubit_count: int = 4,
+    exploration_percent: float = 0.0,
+    batch_count: int = 1,
+    xy_mixer: bool = False,
+    visualise_step_by_step: bool = True,
+):
     # 1. Load Real Amazon Dataset
     data = get_real_amazon_delivery_dataset()
     coords = data["coords"]
@@ -252,22 +270,28 @@ def run_comparative_benchmark(visualise_step_by_step: bool = True):
 
     # 2. Step-by-step visual frame generation toggle
     if visualise_step_by_step:
-        visualize_stepwise_execution(data, qubit_count=4, exploration_percent=0.20, batch_count=2)
+        visualize_stepwise_execution(
+            data,
+            qubit_count=qubit_count,
+            exploration_percent=exploration_percent,
+            batch_count=batch_count,
+            xy_mixer=xy_mixer,
+        )
 
-    # 3. Compute Baseline Costs
-    amazon_open_cost, amazon_closed_cost = compute_route_costs(amazon_tour, matrix)
+    # 3. Compute Baseline Open TSP Cost
+    amazon_open_cost = compute_open_route_cost(amazon_tour, matrix)
 
-    # 4. Execute Full Hybrid Algo 2+5 with qubit_count=4
+    # 4. Execute Full Hybrid Algo 2+5
     hybrid_result = run_algo_hybrid_2_5(
         data,
-        qubit_count=4,
-        exploration_percent=0, #0.20
-        batch_count=2,
-        xy_mixer=False,
+        qubit_count=qubit_count,
+        exploration_percent=exploration_percent,
+        batch_count=batch_count,
+        xy_mixer=xy_mixer,
         seed=2026,
     )
     hybrid_tour = hybrid_result["tour"]
-    hybrid_open_cost, hybrid_closed_cost = compute_route_costs(hybrid_tour, matrix)
+    hybrid_open_cost = compute_open_route_cost(hybrid_tour, matrix)
 
     # 5. Summary Comparison
     print("=" * 70)
@@ -277,74 +301,45 @@ def run_comparative_benchmark(visualise_step_by_step: bool = True):
     print(f"Hybrid QAOA 2+5 Sequence: {hybrid_tour}\n")
 
     open_diff = ((hybrid_open_cost - amazon_open_cost) / amazon_open_cost) * 100
-    closed_diff = ((hybrid_closed_cost - amazon_closed_cost) / amazon_closed_cost) * 100
 
     print(
-        f"1) WITHOUT DEPOT (Open TSP Path):"
+        f"OPEN TSP ROUTE COST (Without Depot Return):"
         f"\n   - Amazon Planned Cost : {amazon_open_cost:.2f}"
         f"\n   - Hybrid 2+5 Cost     : {hybrid_open_cost:.2f}"
-        f"\n   - Cost Improvement    : {-open_diff:+.2f}%\n"
-    )
-
-    print(
-        f"2) WITH DEPOT (Closed Round-Trip TSP):"
-        f"\n   - Amazon Planned Cost : {amazon_closed_cost:.2f}"
-        f"\n   - Hybrid 2+5 Cost     : {hybrid_closed_cost:.2f}"
-        f"\n   - Cost Improvement    : {-closed_diff:+.2f}%"
+        f"\n   - Cost Improvement    : {-open_diff:+.2f}%"
     )
     print("=" * 70)
 
-    # 6. Final Comparative Plot Matrix
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    # 6. Final Comparative Plot (Single Row, 2 Subplots)
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
 
     delivery_indices = [i for i in range(len(coords)) if i != depot_idx]
-    deliv_coords = coords[delivery_indices]
 
-    # --- Row 1: WITHOUT DEPOT IN VISUALS (Only Delivery Stops Plotted) ---
-    ax = axes[0, 0]
+    # Subplot 1: Amazon Planned
+    ax = axes[0]
     amazon_no_depot = [i for i in amazon_tour if i != depot_idx]
     p_amazon = coords[amazon_no_depot]
     ax.plot(p_amazon[:, 0], p_amazon[:, 1], "b-o", linewidth=2, label=f"Amazon Planned ({amazon_open_cost:.2f})")
     for i in delivery_indices:
         ax.annotate(f" {i}", (coords[i, 0], coords[i, 1]), fontsize=10, weight="bold")
-    ax.set_title("Amazon Planned (WITHOUT Depot Visualized)", fontsize=12, weight="bold")
+    ax.set_title("Amazon Planned (Delivery Path)", fontsize=12, weight="bold")
     ax.legend(loc="upper left")
     ax.grid(True, linestyle=":", alpha=0.6)
 
-    ax = axes[0, 1]
+    # Subplot 2: Hybrid Algo 2+5
+    ax = axes[1]
     hybrid_no_depot = [i for i in hybrid_tour if i != depot_idx]
     p_hybrid = coords[hybrid_no_depot]
     ax.plot(p_hybrid[:, 0], p_hybrid[:, 1], "g-o", linewidth=2, label=f"Hybrid 2+5 ({hybrid_open_cost:.2f})")
     for i in delivery_indices:
         ax.annotate(f" {i}", (coords[i, 0], coords[i, 1]), fontsize=10, weight="bold")
-    ax.set_title("Hybrid Algo 2+5 (WITHOUT Depot Visualized)", fontsize=12, weight="bold")
-    ax.legend(loc="upper left")
-    ax.grid(True, linestyle=":", alpha=0.6)
-
-    # --- Row 2: WITH DEPOT IN VISUALS (Includes Far-Off Depot) ---
-    ax = axes[1, 0]
-    p_amazon_closed = coords[amazon_tour + [amazon_tour[0]]]
-    ax.plot(p_amazon_closed[:, 0], p_amazon_closed[:, 1], "b--o", linewidth=2, label=f"Amazon Planned ({amazon_closed_cost:.2f})")
-    ax.scatter(coords[depot_idx, 0], coords[depot_idx, 1], c="red", s=180, marker="s", label="Depot", zorder=5)
-    for i in range(len(coords)):
-        ax.annotate(f" {i}", (coords[i, 0], coords[i, 1]), fontsize=10, weight="bold")
-    ax.set_title("Amazon Planned (WITH Depot Visualized)", fontsize=12, weight="bold")
-    ax.legend(loc="upper left")
-    ax.grid(True, linestyle=":", alpha=0.6)
-
-    ax = axes[1, 1]
-    p_hybrid_closed = coords[hybrid_tour + [hybrid_tour[0]]]
-    ax.plot(p_hybrid_closed[:, 0], p_hybrid_closed[:, 1], "g--o", linewidth=2, label=f"Hybrid 2+5 ({hybrid_closed_cost:.2f})")
-    ax.scatter(coords[depot_idx, 0], coords[depot_idx, 1], c="red", s=180, marker="s", label="Depot", zorder=5)
-    for i in range(len(coords)):
-        ax.annotate(f" {i}", (coords[i, 0], coords[i, 1]), fontsize=10, weight="bold")
-    ax.set_title("Hybrid Algo 2+5 (WITH Depot Visualized)", fontsize=12, weight="bold")
+    ax.set_title("Hybrid Algo 2+5 (Delivery Path)", fontsize=12, weight="bold")
     ax.legend(loc="upper left")
     ax.grid(True, linestyle=":", alpha=0.6)
 
     plt.suptitle(
         f"Real Amazon Dataset Benchmark ({data['route_id']}): Planned vs. Hybrid WS-LR QAOA + LNS",
-        fontsize=15,
+        fontsize=14,
         weight="bold",
     )
     plt.tight_layout()
@@ -355,5 +350,11 @@ def run_comparative_benchmark(visualise_step_by_step: bool = True):
 
 
 if __name__ == "__main__":
-    # Toggle step-by-step visualization generation here
-    run_comparative_benchmark(visualise_step_by_step=True)
+    # Parameters now pass through consistently across benchmark & visualizer
+    run_comparative_benchmark(
+        qubit_count=4,
+        exploration_percent=0.0,
+        batch_count=1,
+        xy_mixer=False,
+        visualise_step_by_step=True,
+    )
