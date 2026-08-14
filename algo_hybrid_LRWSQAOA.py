@@ -10,6 +10,24 @@ Contains full quantum statevector QAOA simulator for local sub-tour optimization
 3. Parameterized QAOA Quantum Circuit (Cost Phase + WS-X or XY Mixer Phase).
 4. Variational parameter optimization (gamma, beta) via COBYLA.
 5. Bitstring state measurement & constraint-repaired tour decoding.
+
+--------------------------------------------------------------------------
+FIX LOG (this revision)
+--------------------------------------------------------------------------
+* _build_qubo_matrix(): the one-hot penalty blocks summed over ALL t2 / i2
+  (including the self term t2==t1 / i2==i1), which cancelled the explicit
+  diagonal "-2P" term back to 0. Net effect: leaving a candidate/position
+  completely unassigned (y=0) cost nothing, so the QUBO only discouraged
+  double-assignment, never under-assignment. Fixed by excluding the self
+  term from the off-diagonal accumulation loop, matching the documented
+  Q_(i,t),(i,t) = M - 2P (t=0) / -2P (t>0) formulation in
+  "algorithm full latex.tex".
+* _qaoa_statevector_simulation(): previously returned None silently when
+  Qiskit was unavailable, and callers treated that as "score every
+  candidate 0", silently degrading to a lowest-index fallback while still
+  labeling the result as QAOA. Now raises clearly instead of failing
+  silently, so a Qiskit-less run cannot be mistaken for a real QAOA run.
+--------------------------------------------------------------------------
 """
 
 import math
@@ -77,7 +95,17 @@ def _solve_lp_relaxation(curr_node, candidates, matrix):
 
 
 def _build_qubo_matrix(curr_node, candidates, matrix, penalty=100.0):
-    """Constructs QUBO matrix Q for Open TSP positional encoding."""
+    """Constructs QUBO matrix Q for Open TSP positional encoding.
+
+    Encodes, for y = sum_t x_{i,t} (or sum_i x_{i,t}):
+        (y - 1)^2 = y^2 - 2y + 1
+                  = -1 * sum_t x_{i,t}          (linear/diagonal part, using x^2=x)
+                    + sum_{t1 != t2} x_{i,t1} x_{i,t2}   (off-diagonal part)
+    scaled by `penalty`, dropping the constant +1. The off-diagonal
+    accumulation loop below MUST exclude the self term (t2==t1 / i2==i1),
+    otherwise it cancels the explicit linear diagonal term back to zero
+    and the constraint stops penalizing an unassigned candidate/position.
+    """
     k = len(candidates)
     n_vars = k * k
     Q = np.zeros((n_vars, n_vars))
@@ -101,6 +129,8 @@ def _build_qubo_matrix(curr_node, candidates, matrix, penalty=100.0):
             idx1 = i * k + t1
             Q[idx1, idx1] += penalty * (1.0 - 2.0)
             for t2 in range(k):
+                if t2 == t1:
+                    continue  # FIX: skip self term, it must not touch the diagonal
                 idx2 = i * k + t2
                 Q[idx1, idx2] += penalty
 
@@ -110,6 +140,8 @@ def _build_qubo_matrix(curr_node, candidates, matrix, penalty=100.0):
             idx1 = i1 * k + t
             Q[idx1, idx1] += penalty * (1.0 - 2.0)
             for i2 in range(k):
+                if i2 == i1:
+                    continue  # FIX: skip self term, it must not touch the diagonal
                 idx2 = i2 * k + t
                 Q[idx1, idx2] += penalty
 
@@ -125,7 +157,17 @@ def _qubo_energy(bitstring, Q):
 def _qaoa_statevector_simulation(
     Q, x_lp, p=1, xy_mixer=False, num_steps=30
 ):
-    """Executes variational QAOA statevector simulation via Qiskit or fallback."""
+    """Executes variational QAOA statevector simulation via Qiskit."""
+    if not HAS_QISKIT:
+        # FIX: fail loudly instead of returning None. The old behavior let
+        # callers silently fall back to a lowest-index heuristic while still
+        # labeling the run "QAOA", which is misleading for any benchmark.
+        raise RuntimeError(
+            "Qiskit is not installed. solve_wslr_qaoa_subtour() requires "
+            "Qiskit to run the actual QAOA circuit; install it with "
+            "`pip install qiskit` rather than silently falling back."
+        )
+
     n_qubits = len(x_lp)
     thetas = 2.0 * np.arcsin(np.sqrt(x_lp))
 
@@ -133,73 +175,66 @@ def _qaoa_statevector_simulation(
         gammas = params[:p]
         betas = params[p:]
 
-        if HAS_QISKIT:
-            qc = QuantumCircuit(n_qubits)
+        qc = QuantumCircuit(n_qubits)
+        for i in range(n_qubits):
+            qc.ry(thetas[i], i)
+
+        for layer in range(p):
+            gamma = gammas[layer]
+            beta = betas[layer]
+
             for i in range(n_qubits):
-                qc.ry(thetas[i], i)
+                if Q[i, i] != 0:
+                    qc.rz(2.0 * gamma * Q[i, i], i)
+            for i in range(n_qubits):
+                for j in range(i + 1, n_qubits):
+                    coeff = Q[i, j] + Q[j, i]
+                    if coeff != 0:
+                        qc.rzz(gamma * coeff, i, j)
 
-            for layer in range(p):
-                gamma = gammas[layer]
-                beta = betas[layer]
-
+            if xy_mixer:
+                for i in range(n_qubits - 1):
+                    qc.rxx(beta, i, i + 1)
+                    qc.ryy(beta, i, i + 1)
+            else:
                 for i in range(n_qubits):
-                    if Q[i, i] != 0:
-                        qc.rz(2.0 * gamma * Q[i, i], i)
-                for i in range(n_qubits):
-                    for j in range(i + 1, n_qubits):
-                        coeff = Q[i, j] + Q[j, i]
-                        if coeff != 0:
-                            qc.rzz(gamma * coeff, i, j)
+                    qc.ry(-thetas[i], i)
+                    qc.rx(2.0 * beta, i)
+                    qc.ry(thetas[i], i)
 
-                if xy_mixer:
-                    for i in range(n_qubits - 1):
-                        qc.rxx(beta, i, i + 1)
-                        qc.ryy(beta, i, i + 1)
-                else:
-                    for i in range(n_qubits):
-                        qc.ry(-thetas[i], i)
-                        qc.rx(2.0 * beta, i)
-                        qc.ry(thetas[i], i)
-
-            return qc
-        return None
+        return qc
 
     def objective(params):
-        if HAS_QISKIT:
-            qc = build_circuit(params)
-            sv = Statevector.from_instruction(qc)
-            probs = sv.probabilities()
+        qc = build_circuit(params)
+        sv = Statevector.from_instruction(qc)
+        probs = sv.probabilities()
 
-            energy = 0.0
-            for idx, prob in enumerate(probs):
-                if prob > 1e-6:
-                    bitstr = [int(b) for b in format(idx, f"0{n_qubits}b")[::-1]]
-                    energy += prob * _qubo_energy(bitstr, Q)
-            return energy
-        return 0.0
+        energy = 0.0
+        for idx, prob in enumerate(probs):
+            if prob > 1e-6:
+                bitstr = [int(b) for b in format(idx, f"0{n_qubits}b")[::-1]]
+                energy += prob * _qubo_energy(bitstr, Q)
+        return energy
 
     init_params = np.array([0.1] * p + [0.5] * p)
 
-    if HAS_QISKIT:
-        res = minimize(objective, init_params, method="COBYLA", options={"maxiter": num_steps})
-        optimal_qc = build_circuit(res.x)
-        sv = Statevector.from_instruction(optimal_qc)
-        probs = sv.probabilities()
+    res = minimize(objective, init_params, method="COBYLA", options={"maxiter": num_steps})
+    optimal_qc = build_circuit(res.x)
+    sv = Statevector.from_instruction(optimal_qc)
+    probs = sv.probabilities()
 
-        best_bitstr = None
-        min_e = float("inf")
+    best_bitstr = None
+    min_e = float("inf")
 
-        for idx, prob in enumerate(probs):
-            if prob > 1e-8:
-                bitstr = [int(b) for b in format(idx, f"0{n_qubits}b")[::-1]]
-                e = _qubo_energy(bitstr, Q)
-                if e < min_e:
-                    min_e = e
-                    best_bitstr = bitstr
+    for idx, prob in enumerate(probs):
+        if prob > 1e-8:
+            bitstr = [int(b) for b in format(idx, f"0{n_qubits}b")[::-1]]
+            e = _qubo_energy(bitstr, Q)
+            if e < min_e:
+                min_e = e
+                best_bitstr = bitstr
 
-        return best_bitstr
-
-    return None
+    return best_bitstr
 
 
 def solve_wslr_qaoa_subtour(

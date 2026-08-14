@@ -312,7 +312,7 @@ if __name__ == "__main__":
         exploration_percents=[0.0, 0.2],
         batch_counts=[1, 2, 3, 4],
         # xy_mixers=[False, True],
-        xy_mixers=[True],
+        xy_mixers=[False],
         output_dir=args.output_dir,
         seed=args.seed,
         generate_plots=not args.no_plots,

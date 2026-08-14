@@ -1,0 +1,5 @@
+1) Ensure algo heuristic is correct
+2) Draw circut for it
+3) 2_5 name Change
+4) make it faster
+5) Column Generation and experiments
