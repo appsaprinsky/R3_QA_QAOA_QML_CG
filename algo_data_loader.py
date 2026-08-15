@@ -1,10 +1,53 @@
 """
 Data Loader for Amazon Last Mile Routing Dataset.
 Parses Amazon PLANNED sequences from route_data.json and travel_times.json.
+
+--------------------------------------------------------------------------
+FIX LOG (this revision)
+--------------------------------------------------------------------------
+* compute_route_cost(): previously computed a CLOSED-loop cost (added
+  `cost_matrix[route_indices[-1], route_indices[0]]`, i.e. a return leg
+  back to the start) and applied an ad hoc `/60.0 if total_cost > 1000`
+  unit-conversion heuristic. Neither of those matches
+  `compute_open_route_cost()` in run_amazon_experiment.py /
+  compare_amazon_planned.py, which is what's actually used for every
+  reported Amazon-vs-Hybrid comparison (open route, no return leg, no
+  unit conversion). The two functions were never called on the same
+  metric in the current scripts, so today's headline numbers are NOT
+  affected -- but `amazon_planned_cost` (computed with the old, different
+  formula) is still attached to every loaded route's data dict, and any
+  future script/notebook that reads it directly instead of recomputing
+  via compute_open_route_cost() would silently get a number on a
+  different basis (closed-loop, possibly minutes instead of raw units).
+  Fixed to match the open-route, no-conversion convention used
+  everywhere else, so the field is safe to read directly from now on.
+* extract_single_route(): added `validate_route()` and call it before
+  returning, to check the two things that actually determine whether an
+  Amazon-vs-Hybrid comparison is apples-to-apples: (1) does the planned
+  sequence cover every node exactly once (some stops can silently be
+  dropped from the planned sequence if they lack a sequence_number in
+  the source data), and (2) does it start at the depot (the hybrid tour
+  always does, since run_algo_hybrid_2_5() explicitly starts at
+  depot_idx -- if the planned sequence doesn't, the two costs are not
+  measuring the same trip). Logs a warning rather than raising, since a
+  malformed route in a 10-route sample shouldn't crash the whole run,
+  but you want to know if it happened.
+* extract_single_route(): depot_idx now breaks on the first "Station"
+  stop and warns if more than one is found, instead of silently taking
+  whichever "Station" happens to be last in dict-iteration order.
+* extract_single_route(): coords are now checked for missing per-node
+  metadata (previously a node missing from stops_meta silently kept
+  coords (0, 0), which is a real lat/lng in the Gulf of Guinea -- this
+  wouldn't trigger the MDS fallback, which only fires if *every* row is
+  zero, so a handful of missing nodes would silently plot at the origin
+  and distort the map). Missing nodes are now tracked and reported;
+  MDS fallback triggers if *any* required node is missing, not just all.
+--------------------------------------------------------------------------
 """
 
 import json
 import os
+import warnings
 import numpy as np
 
 
@@ -50,11 +93,31 @@ class AmazonDataLoader:
         coords = np.zeros((n, 2))
 
         depot_idx = 0
+        station_count = 0
+        missing_coord_nodes = []
         for i, node in enumerate(nodes):
             if node in stops_meta:
                 coords[i] = [stops_meta[node]["lat"], stops_meta[node]["lng"]]
                 if stops_meta[node].get("type") == "Station":
-                    depot_idx = i
+                    station_count += 1
+                    if station_count == 1:
+                        depot_idx = i
+            else:
+                missing_coord_nodes.append(node)
+
+        if station_count > 1:
+            warnings.warn(
+                f"[{route_id}] found {station_count} stops of type 'Station'; "
+                f"using the first one (index {depot_idx}) as depot_idx. "
+                f"Verify this is correct for this route."
+            )
+        if missing_coord_nodes:
+            warnings.warn(
+                f"[{route_id}] {len(missing_coord_nodes)} node(s) missing from "
+                f"stops metadata, coords defaulted to (0, 0): "
+                f"{missing_coord_nodes[:5]}{'...' if len(missing_coord_nodes) > 5 else ''}. "
+                f"These will distort plots/MDS unless handled."
+            )
 
         # --- Extract Amazon PLANNED Sequence ---
         planned_seq = []
@@ -90,7 +153,11 @@ class AmazonDataLoader:
         if not planned_seq:
             planned_seq = list(range(n))
 
-        amazon_planned_cost = self.compute_route_cost(planned_seq, cost_matrix)
+        planned_seq = self._validate_planned_sequence(route_id, planned_seq, n, depot_idx)
+
+        # FIX: use the same cost convention as everywhere else that
+        # actually reports a comparison (open route, no unit conversion).
+        amazon_planned_cost = compute_open_route_cost(planned_seq, cost_matrix)
 
         return {
             "matrix": cost_matrix,
@@ -100,15 +167,81 @@ class AmazonDataLoader:
             "amazon_planned_cost": amazon_planned_cost,
             "n_nodes": n,
             "route_id": route_id,
+            "missing_coord_nodes": missing_coord_nodes,
         }
 
+    def _validate_planned_sequence(self, route_id, planned_seq, n, depot_idx):
+        """
+        Checks the two invariants that determine whether Amazon-planned vs.
+        Hybrid tour costs are actually comparable:
+          1. planned_seq visits every node in range(n) exactly once.
+          2. planned_seq starts at depot_idx (run_algo_hybrid_2_5 always
+             starts there, so if Amazon's sequence doesn't, the two costs
+             describe different trips).
+        Logs a warning and repairs rather than raising, so one malformed
+        route doesn't kill a whole batch run -- but the repair is
+        conservative (append missing nodes at the end, don't guess an
+        order for them) and always logged so it's visible in output.
+        """
+        seq_set = set(planned_seq)
+        expected_set = set(range(n))
+
+        if len(planned_seq) != len(seq_set):
+            warnings.warn(
+                f"[{route_id}] planned_seq contains duplicate node indices; "
+                f"deduplicating (first occurrence kept)."
+            )
+            seen = set()
+            deduped = []
+            for node in planned_seq:
+                if node not in seen:
+                    deduped.append(node)
+                    seen.add(node)
+            planned_seq = deduped
+            seq_set = set(planned_seq)
+
+        missing = expected_set - seq_set
+        if missing:
+            warnings.warn(
+                f"[{route_id}] planned_seq is missing {len(missing)}/{n} node(s) "
+                f"(likely due to missing sequence_number in source data): "
+                f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}. "
+                f"Appending them at the end so amazon_planned_cost covers the "
+                f"same node set as the hybrid tour -- but this changes what "
+                f"'Amazon Planned' means for this route; treat its comparison "
+                f"with extra caution or exclude it from aggregate results."
+            )
+            planned_seq = planned_seq + sorted(missing)
+
+        if planned_seq and planned_seq[0] != depot_idx:
+            warnings.warn(
+                f"[{route_id}] planned_seq does not start at depot_idx "
+                f"({planned_seq[0]} != {depot_idx}). The Hybrid tour always "
+                f"starts at the depot, so costs are not directly comparable "
+                f"as-is. Moving depot_idx to the front to match convention."
+            )
+            planned_seq = [depot_idx] + [x for x in planned_seq if x != depot_idx]
+
+        return planned_seq
+
     def compute_route_cost(self, route_indices, cost_matrix):
-        if not route_indices or len(route_indices) < 2:
-            return 0.0
-        n = len(route_indices)
-        total_cost = 0.0
-        for idx in range(n - 1):
-            u, v = route_indices[idx], route_indices[idx + 1]
-            total_cost += cost_matrix[u, v]
-        total_cost += cost_matrix[route_indices[-1], route_indices[0]]
-        return total_cost / 60.0 if total_cost > 1000 else total_cost
+        """
+        Kept for backward compatibility with any external caller, but now
+        delegates to the same open-route convention used everywhere else
+        instead of silently computing a different (closed-loop,
+        conditionally-rescaled) number under the same-looking name.
+        """
+        return compute_open_route_cost(route_indices, cost_matrix)
+
+
+def compute_open_route_cost(tour, matrix):
+    """
+    Open TSP cost: sum of consecutive edge costs along `tour`, WITHOUT a
+    return-to-start leg. This is the single source of truth for route
+    cost -- run_amazon_experiment.py and compare_amazon_planned.py should
+    both import this rather than defining their own local copies, so the
+    formula can never silently drift between scripts again.
+    """
+    if not tour or len(tour) < 2:
+        return 0.0
+    return float(sum(matrix[tour[i], tour[i + 1]] for i in range(len(tour) - 1)))

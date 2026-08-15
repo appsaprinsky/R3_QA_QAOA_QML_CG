@@ -1,0 +1,7 @@
+qubit_count,exploration_percent,xy_mixer,only_improving_columns,mean_amazon_cost,mean_cg_cost,mean_improvement_pct,win_rate_pct,mean_segments_selected,mean_runtime_sec
+3,0.0,False,True,15090.3,13482.8,10.65,100.0,66.0,12.369
+3,0.2,False,True,15090.3,13482.8,10.65,100.0,66.0,12.455
+4,0.0,False,True,15090.3,15442.6,-2.33,0.0,67.0,210.265
+4,0.2,False,True,15090.3,15442.6,-2.33,0.0,67.0,207.098
+2,0.0,False,True,15090.3,16710.9,-10.74,0.0,70.0,7.582
+2,0.2,False,True,15090.3,16710.9,-10.74,0.0,70.0,5.507

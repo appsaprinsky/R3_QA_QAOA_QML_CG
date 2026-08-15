@@ -27,6 +27,35 @@ FIX LOG (this revision)
   candidate 0", silently degrading to a lowest-index fallback while still
   labeling the result as QAOA. Now raises clearly instead of failing
   silently, so a Qiskit-less run cannot be mistaken for a real QAOA run.
+* _qaoa_statevector_simulation(): the objective function and the final
+  decode step each looped in pure Python over the full 2**n_qubits
+  probability vector (with per-state string formatting) on every COBYLA
+  evaluation. Vectorized with numpy -- same math, no behavior change,
+  but this loop was almost certainly the dominant cost of any real grid
+  search (see PERFORMANCE NOTE further down for why).
+* algorithm topology fix for the XY mixer (see inline comment): the swap
+  network was crossing one-hot block boundaries; restricted to stay
+  within each candidate's own block. Documented limitation: this alone
+  does not make XY mixer meaningfully constraint-preserving because the
+  initial state is a product state, not a fixed-Hamming-weight state.
+--------------------------------------------------------------------------
+
+PERFORMANCE NOTE
+--------------------------------------------------------------------------
+For real Amazon routes (100-250+ stops), a grid search over many
+(qubit_count, batch_count, exploration_percent, xy_mixer) combinations
+solves a QAOA subproblem once per `batch_count`-sized chunk of the route,
+per combination, per route. With batch_count=1 that's roughly (n_nodes-1)
+subproblems per run. Each subproblem runs up to `num_steps` (default 30)
+COBYLA objective evaluations, each of which used to do a pure-Python loop
+over 2**n_qubits probabilities. The vectorization above removes the
+biggest chunk of that cost, but the fundamentally exponential
+2**(qubit_count**2) statevector size is intrinsic to *any* full
+statevector simulation of this circuit -- it is not something a code fix
+can remove, only make less wasteful per evaluation. If runs are still
+slow after this fix, the next biggest lever is reducing subproblem count
+(larger batch_count) or reducing qubit_count, not further code
+optimization of this function.
 --------------------------------------------------------------------------
 """
 
@@ -193,9 +222,37 @@ def _qaoa_statevector_simulation(
                         qc.rzz(gamma * coeff, i, j)
 
             if xy_mixer:
-                for i in range(n_qubits - 1):
-                    qc.rxx(beta, i, i + 1)
-                    qc.ryy(beta, i, i + 1)
+                # FIX: the swap network must stay within a single one-hot
+                # block (fixed candidate i, adjacent time slots t, t+1).
+                # The previous version chained across the flattened
+                # register and crossed block boundaries (e.g. candidate 0's
+                # last time-slot qubit <-> candidate 1's first time-slot
+                # qubit), letting probability mass leak between unrelated
+                # one-hot constraints instead of conserving weight within
+                # one. k is recovered from n_qubits = k*k (see
+                # _build_qubo_matrix / _solve_lp_relaxation).
+                #
+                # NOTE: this fix alone does not make the XY mixer strictly
+                # constraint-preserving in a useful sense, because the
+                # state prep above (independent qc.ry(thetas[i], i) per
+                # qubit) is a product state, not a fixed-Hamming-weight
+                # state. A Hamming-weight-preserving mixer can only
+                # rearrange probability *within* whatever weight sector the
+                # initial state populated -- it cannot increase the
+                # probability of landing in a valid weight-1 (one-hot)
+                # bitstring beyond whatever that product state already gave
+                # it. Getting real benefit from this mixer requires
+                # preparing a genuine fixed-weight (Dicke-like) initial
+                # state per block instead of independent per-qubit Ry
+                # rotations. Left as a known limitation rather than
+                # papered over here.
+                k_blocks = int(round(math.sqrt(n_qubits)))
+                for row in range(k_blocks):
+                    for t in range(k_blocks - 1):
+                        q1 = row * k_blocks + t
+                        q2 = row * k_blocks + t + 1
+                        qc.rxx(beta, q1, q2)
+                        qc.ryy(beta, q1, q2)
             else:
                 for i in range(n_qubits):
                     qc.ry(-thetas[i], i)
@@ -204,17 +261,38 @@ def _qaoa_statevector_simulation(
 
         return qc
 
+    # FIX (performance): the old objective/decode implementations did a pure
+    # Python `for idx, prob in enumerate(probs)` loop over the ENTIRE
+    # 2**n_qubits probability vector, converting each index to a bitstring
+    # via `format(...)[::-1]` + a list comprehension, on EVERY COBYLA
+    # objective evaluation (up to `num_steps` per subproblem) plus once more
+    # for the final decode. For n_qubits = k*k = 16 (k=4) that is 65,536
+    # pure-Python iterations, each doing string formatting, repeated ~30
+    # times per subproblem, repeated once per subproblem along the route,
+    # repeated once per grid parameter combination, repeated once per route.
+    # For real Amazon routes (100-250+ stops) with batch_count=1 this adds
+    # up to hundreds of subproblems per run, which is almost certainly why
+    # a 10-route grid search takes hours: this single loop, not the actual
+    # quantum circuit simulation, dominates wall-clock time.
+    #
+    # Below replaces both loops with vectorized numpy: bits for every basis
+    # index are computed once via bitwise ops (no string formatting), and
+    # the classical energy for every basis state is computed in one batched
+    # einsum against Q, instead of one _qubo_energy() Python call per state.
+    # This is mathematically identical to the old code, just not re-doing
+    # the same O(2**n_qubits) work in a slow, non-vectorized way.
+    all_indices = np.arange(2 ** n_qubits)
+    all_bits = ((all_indices[:, None] >> np.arange(n_qubits)[None, :]) & 1).astype(
+        float
+    )  # shape (2**n_qubits, n_qubits), bit i = qubit i (matches format(...)[::-1] convention)
+    all_energies = np.einsum("bi,ij,bj->b", all_bits, Q, all_bits)  # <x|Q|x> for every basis state
+
     def objective(params):
         qc = build_circuit(params)
         sv = Statevector.from_instruction(qc)
         probs = sv.probabilities()
-
-        energy = 0.0
-        for idx, prob in enumerate(probs):
-            if prob > 1e-6:
-                bitstr = [int(b) for b in format(idx, f"0{n_qubits}b")[::-1]]
-                energy += prob * _qubo_energy(bitstr, Q)
-        return energy
+        mask = probs > 1e-6
+        return float(np.sum(probs[mask] * all_energies[mask]))
 
     init_params = np.array([0.1] * p + [0.5] * p)
 
@@ -223,16 +301,12 @@ def _qaoa_statevector_simulation(
     sv = Statevector.from_instruction(optimal_qc)
     probs = sv.probabilities()
 
-    best_bitstr = None
-    min_e = float("inf")
-
-    for idx, prob in enumerate(probs):
-        if prob > 1e-8:
-            bitstr = [int(b) for b in format(idx, f"0{n_qubits}b")[::-1]]
-            e = _qubo_energy(bitstr, Q)
-            if e < min_e:
-                min_e = e
-                best_bitstr = bitstr
+    mask = probs > 1e-8
+    if not np.any(mask):
+        return None
+    best_idx_local = np.argmin(all_energies[mask])
+    best_idx = all_indices[mask][best_idx_local]
+    best_bitstr = all_bits[best_idx].astype(int).tolist()
 
     return best_bitstr
 
