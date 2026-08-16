@@ -1,7 +1,7 @@
-route_id,n_nodes,qubit_count,exploration_percent,xy_mixer,only_improving_columns,amazon_cost,cg_cost,cost_diff_abs,cost_diff_pct,improvement_pct,runtime_sec,num_priced_columns,num_pool_columns,num_segments_selected,round1_lp_status,round2_master_status,pre_2opt_cost,error
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,2,0.0,False,True,15090.3,16710.9,1620.6,10.74,-10.74,7.582,461,461,70,Optimal,Optimal,16777.5,
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,2,0.2,False,True,15090.3,16710.9,1620.6,10.74,-10.74,5.507,461,461,70,Optimal,Optimal,16777.5,
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,3,0.0,False,True,15090.3,13482.8,-1607.5,-10.65,10.65,12.369,615,615,66,Optimal,Optimal,15223.5,
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,3,0.2,False,True,15090.3,13482.8,-1607.5,-10.65,10.65,12.455,615,615,66,Optimal,Optimal,15223.5,
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,4,0.0,False,True,15090.3,15442.6,352.3,2.33,-2.33,210.265,769,769,67,Optimal,Optimal,15684.2,
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,4,0.2,False,True,15090.3,15442.6,352.3,2.33,-2.33,207.098,769,769,67,Optimal,Optimal,15684.2,
+route_id,n_nodes,qubit_count,exploration_percent,xy_mixer,only_improving_columns,n_iterations_cap,amazon_cost,cg_cost,cost_diff_abs,cost_diff_pct,improvement_pct,runtime_sec,num_iterations_run,num_pool_columns_final,num_segments_selected,final_master_status,pre_2opt_cost,error
+RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,2,0.0,False,True,10,15090.3,13884.2,-1206.1,-7.99,7.99,48.646,9,1268,74,Optimal,16648.4,
+RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,2,0.2,False,True,10,15090.3,13884.2,-1206.1,-7.99,7.99,49.088,9,1268,74,Optimal,16648.4,
+RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,3,0.0,False,True,10,15090.3,14525.9,-564.4,-3.74,3.74,84.327,7,1239,70,Optimal,15338.1,
+RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,3,0.2,False,True,10,15090.3,14525.9,-564.4,-3.74,3.74,84.966,7,1239,70,Optimal,15338.1,
+RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,4,0.0,False,True,10,15090.3,15177.4,87.1,0.58,-0.58,1636.92,8,1582,73,Optimal,15520.7,
+RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,4,0.2,False,True,10,15090.3,15177.4,87.1,0.58,-0.58,1640.755,8,1582,73,Optimal,15520.7,

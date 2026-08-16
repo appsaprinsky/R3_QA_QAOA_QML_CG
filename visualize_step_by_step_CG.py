@@ -2,31 +2,44 @@
 visualize_step_by_step_CG.py
 
 Step-by-step diagnostic visualizer for the Column-Generation Hybrid
-algorithm (cg_hybrid_lrwsqaoa_sub.py). Unlike a route-comparison plot,
-this is meant to show the *mechanics* of the algorithm as it runs:
+algorithm (cg_hybrid_lrwsqaoa_sub.py). Walks through all `n_iterations`
+pricing rounds (default: cg_hybrid_lrwsqaoa_sub.ITERATION_CG), not just a
+single snapshot, then the final master solve:
 
-  1. Round-1 master LP duals -- what price the master initially assigns
-     to covering each node.
-  2. The pricing subproblem in detail, for a sample of starting nodes --
-     which candidates were considered, what path QAOA found, and for
-     every truncation of that path, its cost, the sum of duals it
-     covers, its reduced cost, and whether it survived the filter.
-  3. A reduced-cost histogram across every priced column (not just the
-     detailed sample), so you can see the overall pricing yield.
-  4. The Round-2 master ILP's selected segments, each drawn in its own
+  1. Per-iteration duals -- rendered for EVERY iteration by default
+     (see detail_iterations if you want to restrict this).
+  2. The pricing subproblem in detail, for EVERY starting point, at
+     EVERY rendered iteration by default (see max_detail_nodes if you
+     want to restrict this) -- which candidates were considered, what
+     path QAOA found, and for every truncation of that path, its cost,
+     the sum of duals it covers, its reduced cost, and whether it
+     survived the filter. This matches the algorithm's actual structure
+     exactly: every point is a starting point at every iteration in
+     cg_hybrid_lrwsqaoa_sub.py's _generate_priced_columns, with no
+     depletion of the candidate pool across different starting points --
+     nothing here is a sample of that process.
+  3. Pool growth across all iterations -- pool size and newly-added
+     columns per iteration, so you can see when (or whether) pricing
+     converges before hitting the iteration cap.
+  4. Dual evolution across all iterations, for the same sampled nodes --
+     do the shadow prices stabilize, oscillate, or drift?
+  5. A reduced-cost histogram across every priced column from every
+     iteration.
+  6. The final master ILP's selected segments, each drawn in its own
      color.
-  5. How those segments get concatenated into one tour -- QAOA-found
+  7. How those segments get concatenated into one tour -- QAOA-found
      edges (within a segment) are drawn differently from the greedy
-     "stitch" edges added between segments, so you can see how much of
-     the final tour is quantum-derived versus glued together.
-  6. Before/after cost effect of the closing 2-opt pass.
+     "stitch" edges added between segments.
+  8. Before/after cost effect of the closing 2-opt pass.
 
 Does not modify cg_hybrid_lrwsqaoa_sub.py or algo_hybrid_LRWSQAOA.py --
 it imports and drives their existing functions directly (including a
 few underscore-prefixed internals from cg_hybrid_lrwsqaoa_sub.py, since
 this is a companion diagnostic script for that exact module, the same
 way visualize_step_by_step.py drives solve_wslr_qaoa_subtour from
-algo_hybrid_LRWSQAOA.py without modifying it).
+algo_hybrid_LRWSQAOA.py without modifying it). ITERATION_CG itself is
+imported from cg_hybrid_lrwsqaoa_sub.py rather than redefined here, so
+there is one single source of truth for the default iteration count.
 
 Saves frames into 'cg_visualizations/' without GUI blocking.
 """
@@ -43,6 +56,7 @@ from matplotlib.lines import Line2D
 
 from algo_hybrid_LRWSQAOA import solve_wslr_qaoa_subtour
 import cg_hybrid_lrwsqaoa_sub as cg
+from cg_hybrid_lrwsqaoa_sub import ITERATION_CG
 from plot_publication import (
     _style_axes,
     _plot_directional_route,
@@ -53,8 +67,7 @@ from plot_publication import (
 )
 
 SEGMENT_CMAP = plt.get_cmap("tab20")
-COLOR_KEPT = "#1a7a1a"
-COLOR_DROPPED = "#b0b0b0"
+ITERATION_CMAP = plt.get_cmap("viridis")
 COLOR_STITCH = "#C1272D"
 
 
@@ -69,54 +82,45 @@ def generate_random_tsp_data(n_nodes=16, seed=101):
 
 
 # =====================================================================
-# Frame 1: Round-1 duals
+# Per-iteration duals snapshot
 # =====================================================================
 
-def _frame_initial_duals(coords, depot_idx, duals, n, output_dir, formats):
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.8))
-
-    ax = axes[0]
-    for i in range(n):
-        if i == depot_idx:
-            continue
-        ax.plot([coords[depot_idx, 0], coords[i, 0]], [coords[depot_idx, 1], coords[i, 1]],
-                color="#9db8d8", linewidth=0.9, alpha=0.7, zorder=1)
-    ax.scatter(coords[:, 0], coords[:, 1], c="#3b6fa0", s=55, zorder=3, edgecolors="white", linewidths=0.6)
-    ax.scatter(*coords[depot_idx], c=COLOR_DEPOT, s=200, marker="D", zorder=5,
-               edgecolors="white", linewidths=1.3, label="Depot")
-    ax.set_title("Initial Columns (Singletons, Cost = Distance from Depot)", fontsize=10.5)
-    ax.legend(loc="best")
-    _style_axes(ax)
-
-    ax = axes[1]
+def _frame_duals_snapshot(depot_idx, duals, n, iteration, pool_size, output_dir, formats):
+    fig, ax = plt.subplots(figsize=(9, 5.2))
     node_ids = list(range(n))
     values = [duals.get(i, 0.0) for i in node_ids]
     colors = [COLOR_DEPOT if i == depot_idx else "#3b6fa0" for i in node_ids]
     ax.bar(node_ids, values, color=colors, width=0.75, edgecolor="white", linewidth=0.4)
     ax.set_xlabel("Node index")
     ax.set_ylabel("Dual price  $\\pi_i$")
-    ax.set_title("Round-1 LP Duals  ($\\pi_i$ = distance(depot, i))", fontsize=10.5)
+    ax.set_title(f"Iteration {iteration} \u2014 LP duals over a pool of {pool_size} columns", fontsize=11)
     ax.grid(True, axis="y", linestyle="--", linewidth=0.6, color=COLOR_GRID, zorder=0)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    fig.suptitle("Step 1 — Round 1: Master LP Relaxation & Duals", fontsize=13, y=0.99)
-    fig.subplots_adjust(top=0.85)
-    _save_all_formats(fig, os.path.join(output_dir, "01_round1_duals"), formats)
+    fig.suptitle(f"Step 1.{iteration} \u2014 Master LP Duals", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    _save_all_formats(fig, os.path.join(output_dir, f"01_{iteration:02d}_duals"), formats)
     plt.close(fig)
 
 
 # =====================================================================
-# Frame 2 (repeated): pricing subproblem detail for a sampled node
+# Pricing subproblem detail for a sampled node within a sampled iteration
 # =====================================================================
 
 def _frame_pricing_node(
     frame_idx, coords, matrix, curr_node, nearest, explore, full_nodes,
-    truncation_records, output_dir, formats,
+    truncation_records, candidate_rows, iteration, output_dir, formats,
 ):
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6.4), gridspec_kw={"width_ratios": [1.15, 1]})
+    # Figure height grows with row count so a full candidate list (every
+    # other node, not a capped sample) stays readable instead of being
+    # squeezed into a fixed-size table.
+    n_rows = max(len(candidate_rows), len(truncation_records), 1)
+    fig_height = max(6.6, 1.8 + 0.30 * n_rows)
 
-    # --- Left: map of this pricing subproblem ---
+    fig, axes = plt.subplots(1, 3, figsize=(19.5, fig_height),
+                              gridspec_kw={"width_ratios": [1.0, 1.0, 0.95]})
+
     ax = axes[0]
     ax.scatter(coords[:, 0], coords[:, 1], c="#d9d9d9", s=35, zorder=1)
     if nearest:
@@ -129,7 +133,7 @@ def _frame_pricing_node(
                    edgecolors="white", linewidths=0.8, label="Exploration candidate")
 
     full_path_coords = coords[full_nodes]
-    _plot_directional_route(ax, full_path_coords, cmap_name="Purples", linewidth=2.4, zorder=4)
+    _plot_directional_route(ax, full_path_coords, "#5b2d8e", linewidth=1.6, zorder=4)
     ax.scatter(*coords[curr_node], c="#1a1a1a", s=210, marker="*", zorder=6,
                edgecolors="white", linewidths=1.0, label=f"Start node {curr_node}")
 
@@ -137,34 +141,90 @@ def _frame_pricing_node(
         ax.annotate(str(idx), (coords[idx, 0], coords[idx, 1]), fontsize=7.5,
                     color=COLOR_TEXT, xytext=(3, 3), textcoords="offset points", zorder=7)
 
-    ax.set_title(f"QAOA sub-tour from node {curr_node}", fontsize=10.5)
+    ax.set_title(f"QAOA sub-tour from node {curr_node}  (iteration {iteration}"
+                 f"{', dual-filtered' if iteration >= 2 else ''})", fontsize=10.5)
     ax.legend(loc="best", fontsize=8)
     _style_axes(ax)
 
-    # --- Right: truncation table ---
-    ax2 = axes[1]
+    # --- Middle panel: candidate-selection economics ---
+    # This is the step that was invisible before: for iteration >= 2,
+    # "nearest" candidates are NOT simply the closest-by-distance nodes --
+    # they are the closest nodes AMONG those with distance(curr, x) -
+    # dual(x) < 0 (i.e. individually negative reduced cost). This table
+    # shows that computation directly, per candidate node, instead of
+    # only showing which nodes ended up selected.
+    ax1 = axes[1]
+    ax1.axis("off")
+    cand_labels = ["Node", "Dist", "Dual", "Dist \u2212 Dual", "Selected as"]
+    cand_text = []
+    cand_colors = []
+    for row in candidate_rows:
+        node, dist, dual, net, role = row
+        cand_text.append([
+            str(node),
+            f"{dist:.1f}",
+            f"{dual:.1f}",
+            f"{net:+.1f}",
+            role,
+        ])
+        if role == "nearest":
+            row_color = "#dbe8f5"
+        elif role == "explore":
+            row_color = "#fbe6d2"
+        else:
+            row_color = "#f2f2f2"
+        cand_colors.append([row_color] * len(cand_labels))
+
+    cand_table = ax1.table(cellText=cand_text, colLabels=cand_labels, cellColours=cand_colors,
+                            cellLoc="center", loc="center",
+                            colWidths=[0.16, 0.16, 0.16, 0.28, 0.24])
+    cand_table.auto_set_font_size(False)
+    cand_table.set_fontsize(9)
+    cand_table.scale(1, 1.85)
+    for (row, col), cell in cand_table.get_celld().items():
+        if row == 0:
+            cell.set_facecolor("#2B2B2B")
+            cell.set_text_props(color="white", weight="bold")
+        cell.set_edgecolor("#cccccc")
+
+    if iteration >= 2:
+        subtitle = "\"Nearest\" = smallest (dist \u2212 dual), ranked -- not a sign filter"
+    else:
+        subtitle = "Iteration 1: plain closest-by-distance (duals not yet used)"
+    ax1.set_title(f"Candidate selection at node {curr_node}\n{subtitle}", fontsize=10, pad=14)
+    ax1.set_xlim(0, 1)
+
+    # --- Right panel: prefix truncations (column pricing outcome) ---
+    ax2 = axes[2]
     ax2.axis("off")
     col_labels = ["Column", "Cost", "\u03a3 duals", "Red. cost", "Kept?"]
     cell_text = []
     cell_colors = []
-    for rec in truncation_records:
-        path_str = "\u2192".join(str(x) for x in rec["nodes"])
-        cell_text.append([
-            path_str,
-            f"{rec['cost']:.1f}",
-            f"{rec['dual_sum']:.1f}",
-            f"{rec['reduced_cost']:+.1f}",
-            "kept" if rec["kept"] else "dropped",
-        ])
-        row_color = "#e6f4e6" if rec["kept"] else "#f2f2f2"
-        cell_colors.append([row_color] * len(col_labels))
+    if truncation_records:
+        for rec in truncation_records:
+            path_str = "\u2192".join(str(x) for x in rec["nodes"])
+            cell_text.append([
+                path_str,
+                f"{rec['cost']:.1f}",
+                f"{rec['dual_sum']:.1f}",
+                f"{rec['reduced_cost']:+.1f}",
+                "kept" if rec["kept"] else "dropped",
+            ])
+            row_color = "#e6f4e6" if rec["kept"] else "#f2f2f2"
+            cell_colors.append([row_color] * len(col_labels))
+    else:
+        # No candidates -> QAOA never ran for this node this iteration.
+        # Still show the trivial singleton column rather than an empty
+        # table, so the "why nothing happened here" case is explicit.
+        cell_text.append([str(curr_node), "0.0", "0.0", "+0.0", "kept (singleton)"])
+        cell_colors.append(["#e6f4e6"] * len(col_labels))
 
     table = ax2.table(cellText=cell_text, colLabels=col_labels, cellColours=cell_colors,
                        cellLoc="center", loc="center",
                        colWidths=[0.34, 0.14, 0.16, 0.20, 0.16])
     table.auto_set_font_size(False)
     table.set_fontsize(9)
-    table.scale(1, 1.9)
+    table.scale(1, 1.85)
     for (row, col), cell in table.get_celld().items():
         if row == 0:
             cell.set_facecolor("#2B2B2B")
@@ -174,22 +234,101 @@ def _frame_pricing_node(
             cell.PAD = 0.02
         cell.set_edgecolor("#cccccc")
 
-    ax2.set_title("Prefix truncations priced against Round-1 duals", fontsize=10.5, pad=14)
+    if not truncation_records:
+        ax2.text(0.5, 0.15, "No candidates qualified this iteration\n(every dist \u2212 dual \u2265 0)",
+                  transform=ax2.transAxes, ha="center", va="top", fontsize=9,
+                  color="#a03030", style="italic")
+
+    ax2.set_title(f"Prefix truncations (full path), iteration {iteration} duals", fontsize=10, pad=14)
     ax2.set_xlim(0, 1)
 
-    fig.suptitle(f"Step 2.{frame_idx} — Pricing Subproblem: start node {curr_node}", fontsize=13, y=0.98)
-    fig.subplots_adjust(top=0.86, wspace=0.25)
-    _save_all_formats(fig, os.path.join(output_dir, f"02_{frame_idx:02d}_pricing_node{curr_node}"), formats)
+    fig.suptitle(f"Step 2 \u2014 Pricing Subproblem: node {curr_node}, iteration {iteration}", fontsize=13, y=0.98)
+    fig.subplots_adjust(top=0.84, wspace=0.3)
+    _save_all_formats(
+        fig, os.path.join(output_dir, f"02_{frame_idx:03d}_iter{iteration}_node{curr_node}"), formats
+    )
     plt.close(fig)
 
 
 # =====================================================================
-# Frame 3: reduced-cost histogram across all priced columns
+# Pool growth across all iterations
 # =====================================================================
 
-def _frame_reduced_cost_histogram(all_priced, output_dir, formats):
+def _frame_pool_growth(iteration_log, output_dir, formats):
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.2))
+
+    iters = [row["iteration"] for row in iteration_log]
+    pool_sizes = [row["pool_size"] for row in iteration_log]
+    new_cols = [row["num_new_columns"] for row in iteration_log]
+
+    ax = axes[0]
+    ax.plot(iters, pool_sizes, "-o", color="#3b6fa0", linewidth=2.2, markersize=6, zorder=3)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Cumulative pool size")
+    ax.set_title("Column pool growth", fontsize=10.5)
+    ax.set_xticks(iters)
+    ax.grid(True, linestyle="--", linewidth=0.6, color=COLOR_GRID, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    ax = axes[1]
+    colors = ["#1a7a1a" if c > 0 else "#b0b0b0" for c in new_cols]
+    ax.bar(iters, new_cols, color=colors, width=0.6, edgecolor="white", linewidth=0.4, zorder=3)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("New columns added")
+    converged_at = next((row["iteration"] for row in iteration_log if row["num_new_columns"] == 0), None)
+    title = "New columns per iteration"
+    if converged_at is not None:
+        title += f"  (converged at iteration {converged_at})"
+    ax.set_title(title, fontsize=10.5)
+    ax.set_xticks(iters)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, color=COLOR_GRID, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.suptitle("Step 3 \u2014 Column Pool Growth Across Iterations", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    _save_all_formats(fig, os.path.join(output_dir, "03_pool_growth"), formats)
+    plt.close(fig)
+
+
+# =====================================================================
+# Dual evolution across all iterations, for a sample of nodes
+# =====================================================================
+
+def _frame_dual_evolution(dual_history, sample_nodes, depot_idx, output_dir, formats):
+    fig, ax = plt.subplots(figsize=(10, 5.6))
+    iters = list(range(1, len(dual_history) + 1))
+
+    for i, node in enumerate(sample_nodes):
+        values = [dh.get(node, 0.0) for dh in dual_history]
+        color = COLOR_DEPOT if node == depot_idx else ITERATION_CMAP(i / max(len(sample_nodes) - 1, 1))
+        lw = 2.6 if node == depot_idx else 1.8
+        ax.plot(iters, values, "-o", color=color, linewidth=lw, markersize=4.5,
+                label=f"node {node}" + (" (depot)" if node == depot_idx else ""), zorder=3)
+
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Dual price  $\\pi_i$")
+    ax.set_title("Sampled nodes' dual prices across iterations", fontsize=11)
+    ax.set_xticks(iters)
+    ax.legend(loc="best", fontsize=8, ncol=2)
+    ax.grid(True, linestyle="--", linewidth=0.6, color=COLOR_GRID, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.suptitle("Step 4 \u2014 Dual Price Evolution", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    _save_all_formats(fig, os.path.join(output_dir, "04_dual_evolution"), formats)
+    plt.close(fig)
+
+
+# =====================================================================
+# Reduced-cost histogram across every priced column, all iterations
+# =====================================================================
+
+def _frame_reduced_cost_histogram(all_truncations, output_dir, formats):
     fig, ax = plt.subplots(figsize=(9, 5.5))
-    reduced_costs = [c["reduced_cost"] for c in all_priced if len(c["nodes"]) > 1]
+    reduced_costs = [c["reduced_cost"] for c in all_truncations if len(c["nodes"]) > 1]
     if not reduced_costs:
         reduced_costs = [0.0]
     n_kept = sum(1 for c in reduced_costs if c < 0)
@@ -201,7 +340,7 @@ def _frame_reduced_cost_histogram(all_priced, output_dir, formats):
     ax.set_xlabel("Reduced cost  (cost \u2212 \u03a3 duals)")
     ax.set_ylabel("Number of priced columns")
     ax.set_title(
-        f"Pricing yield across all nodes  \u2022  {n_kept} improving  /  {n_dropped} non-improving",
+        f"Pricing yield across all iterations \u2022 {n_kept} improving  /  {n_dropped} non-improving",
         fontsize=11,
     )
     ax.legend(loc="best")
@@ -209,14 +348,14 @@ def _frame_reduced_cost_histogram(all_priced, output_dir, formats):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    fig.suptitle("Step 3 — Reduced-Cost Distribution (Pricing Summary)", fontsize=13)
+    fig.suptitle("Step 5 \u2014 Reduced-Cost Distribution (All Iterations)", fontsize=13)
     fig.tight_layout(rect=[0, 0, 1, 0.94])
-    _save_all_formats(fig, os.path.join(output_dir, "03_reduced_cost_histogram"), formats)
+    _save_all_formats(fig, os.path.join(output_dir, "05_reduced_cost_histogram"), formats)
     plt.close(fig)
 
 
 # =====================================================================
-# Frame 4: final master ILP solution -- selected segments
+# Final master ILP solution -- selected segments
 # =====================================================================
 
 def _frame_final_master(coords, depot_idx, selected_columns, n_pool, output_dir, formats):
@@ -240,24 +379,21 @@ def _frame_final_master(coords, depot_idx, selected_columns, n_pool, output_dir,
     ]
     ax.legend(handles=legend_handles, loc="best")
     ax.set_title(
-        f"{len(selected_columns)} segments selected out of {n_pool} priced columns", fontsize=11,
+        f"{len(selected_columns)} segments selected out of {n_pool} pool columns", fontsize=11,
     )
     _style_axes(ax)
 
-    fig.suptitle("Step 4 — Round 2: Final Master ILP Solution", fontsize=13, y=0.99)
+    fig.suptitle("Step 6 \u2014 Final Master ILP Solution", fontsize=13, y=0.99)
     fig.subplots_adjust(top=0.90)
-    _save_all_formats(fig, os.path.join(output_dir, "04_final_master_segments"), formats)
+    _save_all_formats(fig, os.path.join(output_dir, "06_final_master_segments"), formats)
     plt.close(fig)
 
 
 # =====================================================================
-# Frame 5: concatenation -- QAOA edges vs. greedy stitch edges
+# Concatenation -- QAOA edges vs. greedy stitch edges
 # =====================================================================
 
 def _frame_concatenation(coords, depot_idx, selected_columns, raw_tour, matrix, output_dir, formats):
-    # Recompute concatenation order the same way _concatenate_segments does,
-    # but also record which edges are "stitch" edges (segment boundaries)
-    # vs. "within-segment" (QAOA-found) edges, for visualization.
     depot_segments = [c for c in selected_columns if c["nodes"][0] == depot_idx]
     other_segments = [c for c in selected_columns if c["nodes"][0] != depot_idx]
     depot_segments.sort(key=lambda c: c["cost"])
@@ -305,34 +441,34 @@ def _frame_concatenation(coords, depot_idx, selected_columns, raw_tour, matrix, 
     )
     _style_axes(ax)
 
-    fig.suptitle("Step 5 — Segment Concatenation Order", fontsize=13, y=0.99)
+    fig.suptitle("Step 7 \u2014 Segment Concatenation Order", fontsize=13, y=0.99)
     fig.subplots_adjust(top=0.90)
-    _save_all_formats(fig, os.path.join(output_dir, "05_concatenation"), formats)
+    _save_all_formats(fig, os.path.join(output_dir, "07_concatenation"), formats)
     plt.close(fig)
 
 
 # =====================================================================
-# Frame 6: before/after 2-opt
+# Before/after 2-opt
 # =====================================================================
 
 def _frame_two_opt_before_after(coords, depot_idx, raw_tour, final_tour, raw_cost, final_cost, output_dir, formats):
     fig, axes = plt.subplots(1, 2, figsize=(13, 6.2))
 
-    for ax, tour, cost, title, cmap in [
-        (axes[0], raw_tour, raw_cost, "Before 2-opt (segments concatenated)", "Oranges"),
-        (axes[1], final_tour, final_cost, "After 2-opt", "Greens"),
+    for ax, tour, cost, title, color in [
+        (axes[0], raw_tour, raw_cost, "Before 2-opt (segments concatenated)", "#c0621a"),
+        (axes[1], final_tour, final_cost, "After 2-opt", "#1a6b1a"),
     ]:
         path_coords = coords[tour]
-        _plot_directional_route(ax, path_coords, cmap_name=cmap, linewidth=2.4, zorder=3)
+        _plot_directional_route(ax, path_coords, color, linewidth=1.6, zorder=3)
         ax.scatter(*coords[depot_idx], c=COLOR_DEPOT, s=190, marker="D", zorder=6,
                    edgecolors="white", linewidths=1.2)
         ax.set_title(f"{title}\nCost: {cost:.2f}", fontsize=10.5)
         _style_axes(ax)
 
     delta_pct = 100.0 * (raw_cost - final_cost) / raw_cost if raw_cost else 0.0
-    fig.suptitle(f"Step 6 — Closing 2-opt Pass  \u2022  {delta_pct:.1f}% shorter", fontsize=13, y=0.99)
+    fig.suptitle(f"Step 8 \u2014 Closing 2-opt Pass  \u2022  {delta_pct:.1f}% shorter", fontsize=13, y=0.99)
     fig.subplots_adjust(top=0.84)
-    _save_all_formats(fig, os.path.join(output_dir, "06_two_opt_before_after"), formats)
+    _save_all_formats(fig, os.path.join(output_dir, "08_two_opt_before_after"), formats)
     plt.close(fig)
 
 
@@ -346,20 +482,36 @@ def visualize_cg_stepwise_execution(
     exploration_percent=0.0,
     xy_mixer=False,
     only_improving_columns=True,
-    max_detail_nodes=6,
+    n_iterations=ITERATION_CG,
+    detail_iterations=None,
+    max_detail_nodes=None,
     seed=101,
     output_dir="cg_visualizations",
     formats=("png",),
 ):
     """
-    Runs the CG algorithm's logic step by step (Round 1 -> pricing over
-    every node -> Round 2 -> concatenation -> 2-opt), saving a diagnostic
-    frame at each stage. Detailed per-node pricing frames are rendered
-    for an evenly-spaced sample of `max_detail_nodes` starting nodes
-    (always including the depot), but pricing itself still runs over
-    EVERY node so the resulting column pool and final tour are identical
-    to what run_cg_hybrid_lrwsqaoa_sub() would produce with the same
-    seed and parameters.
+    Runs the CG algorithm's logic step by step across all `n_iterations`
+    pricing rounds (LP relaxation -> price over every node -> grow pool),
+    then the final ILP round, concatenation, and 2-opt -- saving
+    diagnostic frames along the way.
+
+    By default, EVERY point is a rendered starting point at EVERY
+    iteration -- no sampling of either dimension. For n points and
+    n_iterations iterations, that is n * n_iterations pricing-detail
+    frames (e.g. 10 points x 3 iterations = 30 frames, 100 points x 10
+    iterations = 1000 frames). This matches the algorithm's actual
+    structure exactly -- every point IS a starting point at every
+    iteration in cg_hybrid_lrwsqaoa_sub.py's _generate_priced_columns,
+    with no depletion of the candidate pool across different starting
+    points -- and the visualization now shows all of it rather than a
+    sample.
+
+    `detail_iterations` and `max_detail_nodes` remain available if you
+    explicitly want to restrict rendering (e.g. for a very large route
+    where thousands of frames aren't practical) -- pass an explicit set
+    of iteration numbers, and/or an integer to cap how many points get a
+    frame per rendered iteration. Left as None (the default), both are
+    unrestricted: every iteration, every point.
     """
     os.makedirs(output_dir, exist_ok=True)
     rng = np.random.default_rng(seed)
@@ -368,105 +520,179 @@ def visualize_cg_stepwise_execution(
     coords = data["coords"]
     n = data["n_nodes"]
     depot_idx = data.get("depot_idx", 0)
+    n_iterations = max(1, n_iterations)
+    global_max_dist = float(matrix.max()) if n > 1 else 0.0
+
+    if detail_iterations is None:
+        detail_iterations = set(range(1, n_iterations + 1))  # every iteration, no sampling
+    else:
+        detail_iterations = set(detail_iterations)
+
+    if max_detail_nodes is None:
+        detail_nodes = set(range(n))  # every point, no sampling
+    else:
+        detail_nodes = set(np.linspace(0, n - 1, num=min(max_detail_nodes, n), dtype=int).tolist())
+        detail_nodes.add(depot_idx)
 
     t_start = time.time()
-
-    # --- Round 1 ---
-    print("Step 1: Round-1 LP relaxation for duals...")
-    initial_columns = cg._build_initial_columns(n, matrix, depot_idx)
-    status1, _, _, duals = cg._solve_master(initial_columns, list(range(n)), relaxation=True)
-    print(f"  status={status1}, sample duals={[round(duals.get(i,0),1) for i in range(min(n,5))]}")
-    _frame_initial_duals(coords, depot_idx, duals, n, output_dir, formats)
-
-    # --- Pricing over every node, with detail frames for a sample ---
-    detail_nodes = set(np.linspace(0, n - 1, num=min(max_detail_nodes, n), dtype=int).tolist())
-    detail_nodes.add(depot_idx)
-
-    all_priced = []
+    pool = cg._build_initial_columns(n, matrix, depot_idx)
+    dual_history = []
+    iteration_log = []
     all_truncations_for_stats = []
-    frame_idx = 0
-    print(f"Step 2: Pricing subproblem over all {n} nodes "
-          f"(detailed frames for {sorted(detail_nodes)})...")
-    for curr_node in range(n):
-        exclude = {depot_idx} if curr_node != depot_idx else set()
-        k_batch = min(qubit_count, n - 1 - len(exclude))
-        if k_batch <= 0:
-            continue
+    pricing_frame_counter = 0
 
-        others = [i for i in range(n) if i != curr_node and i not in exclude]
-        others_sorted = sorted(others, key=lambda x: (matrix[curr_node, x], x))
-        if exploration_percent <= 0.0 or k_batch <= 1:
-            nearest, explore = others_sorted[:k_batch], []
+    print(f"Running {n_iterations} pricing iteration(s) (detail frames at iterations "
+          f"{sorted(detail_iterations)}, nodes {sorted(detail_nodes)})...")
+
+    for it in range(1, n_iterations + 1):
+        status_lp, _, _, duals = cg._solve_master(pool, list(range(n)), relaxation=True)
+        dual_history.append(dict(duals))
+        render_detail_this_iter = it in detail_iterations
+
+        if render_detail_this_iter:
+            _frame_duals_snapshot(depot_idx, duals, n, it, len(pool), output_dir, formats)
+
+        priced_this_iter = []
+        apply_dual_candidate_filter = (it >= 2)
+
+        # QAOA itself incorporates duals from iteration >= 2 onward, mirroring
+        # cg_hybrid_lrwsqaoa_sub.py's _generate_priced_columns exactly: solve
+        # over a dual-adjusted matrix (column j reduced by duals[j]) instead
+        # of raw distances, so QAOA searches for low REDUCED-cost orderings.
+        # Cost bookkeeping below still always uses the raw `matrix`.
+        if apply_dual_candidate_filter:
+            duals_vector = np.array([duals.get(j, 0.0) for j in range(n)])
+            qaoa_matrix = matrix - duals_vector[np.newaxis, :]
         else:
-            import math
-            n_explore = min(int(math.floor(k_batch * exploration_percent)), k_batch - 1)
-            n_nearest = k_batch - n_explore
-            nearest = others_sorted[:n_nearest]
-            remaining = others_sorted[n_nearest:]
-            if n_explore > 0 and remaining:
-                idx = rng.choice(len(remaining), size=min(n_explore, len(remaining)), replace=False)
-                explore = [remaining[i] for i in idx]
-            else:
-                explore = []
-        candidates = nearest + explore
-        if not candidates:
-            continue
+            qaoa_matrix = matrix
 
-        subtour = solve_wslr_qaoa_subtour(curr_node, candidates, matrix, xy_mixer=xy_mixer)
-        if not subtour:
-            continue
-        full_nodes = [curr_node] + subtour
+        for curr_node in range(n):
+            exclude = {depot_idx} if curr_node != depot_idx else set()
+            k_batch = min(qubit_count, n - 1 - len(exclude))
+            if k_batch <= 0:
+                continue
 
-        truncation_records = []
-        for L in range(len(full_nodes), 0, -1):
-            seg = full_nodes[:L]
-            seg_cost = cg._open_path_cost(seg, matrix)
-            dual_sum = sum(duals.get(node, 0.0) for node in seg)
-            reduced_cost = seg_cost - dual_sum
-            kept = (reduced_cost < -1e-9) or (L == 1)
-            record = {"nodes": seg, "cost": seg_cost, "dual_sum": dual_sum,
-                      "reduced_cost": reduced_cost, "kept": kept, "start": curr_node}
-            truncation_records.append(record)
-            all_truncations_for_stats.append(record)
-            if (not only_improving_columns) or kept:
-                all_priced.append(record)
+            # Uses the SAME dual-aware selection as cg_hybrid_lrwsqaoa_sub.py's
+            # _generate_priced_columns (imported directly, not reimplemented),
+            # so the pool this driver builds up is byte-for-byte what
+            # run_cg_hybrid_lrwsqaoa_sub() would produce with the same seed.
+            # Every curr_node searches its own full candidate pool
+            # independently here -- nothing is removed from later nodes'
+            # searches because an earlier node happened to select it.
+            nearest, explore = cg._dual_aware_nearest_and_explore(
+                curr_node, exclude, matrix, k_batch, exploration_percent, rng,
+                duals=(duals if apply_dual_candidate_filter else None),
+                global_max_dist=global_max_dist,
+            )
+            candidates = nearest + explore
 
-        if curr_node in detail_nodes:
-            frame_idx += 1
-            _frame_pricing_node(frame_idx, coords, matrix, curr_node, nearest, explore,
-                                 full_nodes, truncation_records, output_dir, formats)
-            print(f"  [detail frame {frame_idx}] node {curr_node}: "
-                  f"{sum(r['kept'] for r in truncation_records)}/{len(truncation_records)} kept")
+            want_detail = render_detail_this_iter and curr_node in detail_nodes
+            if want_detail:
+                # Candidate-selection economics for this node: distance,
+                # dual, and distance-minus-dual for EVERY other node under
+                # consideration -- all of them, not a sampled subset. This
+                # is what makes the "smallest reduced cost among all points"
+                # ranking (used from iteration >= 2) fully visible, matching
+                # what the algorithm itself actually searches over (every
+                # other node in the graph, subject only to RADIUS_POOL_SEARCH,
+                # which defaults to no restriction).
+                #
+                # Computed BEFORE the "no candidates" check below and
+                # rendered regardless of whether anything qualified.
+                others = [i for i in range(n) if i != curr_node and i not in exclude]
+                others_sorted = sorted(others, key=lambda x: (matrix[curr_node, x], x))
+                selected_set = set(nearest) | set(explore)
+                if apply_dual_candidate_filter:
+                    # Rank order (smallest dist-dual first), same as the
+                    # actual selection criterion -- not sorted by distance.
+                    ordered_for_table = sorted(
+                        others_sorted,
+                        key=lambda x: (matrix[curr_node, x] - duals.get(x, 0.0), matrix[curr_node, x], x),
+                    )
+                else:
+                    ordered_for_table = others_sorted
+                candidate_rows = [
+                    (x, float(matrix[curr_node, x]), float(duals.get(x, 0.0)),
+                     float(matrix[curr_node, x]) - float(duals.get(x, 0.0)),
+                     "nearest" if x in nearest else ("explore" if x in explore else "-"))
+                    for x in ordered_for_table
+                ]
 
+            if not candidates:
+                if want_detail:
+                    pricing_frame_counter += 1
+                    _frame_pricing_node(pricing_frame_counter, coords, matrix, curr_node, nearest, explore,
+                                         [curr_node], [], candidate_rows, it, output_dir, formats)
+                continue
+
+            subtour = solve_wslr_qaoa_subtour(curr_node, candidates, qaoa_matrix, xy_mixer=xy_mixer)
+            if not subtour:
+                if want_detail:
+                    pricing_frame_counter += 1
+                    _frame_pricing_node(pricing_frame_counter, coords, matrix, curr_node, nearest, explore,
+                                         [curr_node], [], candidate_rows, it, output_dir, formats)
+                continue
+            full_nodes = [curr_node] + subtour
+
+            truncation_records = []
+            for L in range(len(full_nodes), 0, -1):
+                seg = full_nodes[:L]
+                seg_cost = cg._open_path_cost(seg, matrix)  # raw matrix -- real cost
+                dual_sum = sum(duals.get(node, 0.0) for node in seg)
+                reduced_cost = seg_cost - dual_sum
+                kept = (reduced_cost < -1e-9) or (L == 1)
+                record = {"nodes": seg, "cost": seg_cost, "dual_sum": dual_sum,
+                          "reduced_cost": reduced_cost, "kept": kept, "start": curr_node}
+                truncation_records.append(record)
+                all_truncations_for_stats.append(record)
+                if (not only_improving_columns) or kept:
+                    priced_this_iter.append(record)
+
+            if want_detail:
+                pricing_frame_counter += 1
+                _frame_pricing_node(pricing_frame_counter, coords, matrix, curr_node, nearest, explore,
+                                     full_nodes, truncation_records, candidate_rows, it, output_dir, formats)
+
+        pool_before = len(pool)
+        pool = cg._dedupe_columns(pool + priced_this_iter)
+        n_new = len(pool) - pool_before
+        iteration_log.append({
+            "iteration": it, "lp_status": status_lp, "num_priced": len(priced_this_iter),
+            "num_new_columns": n_new, "pool_size": len(pool),
+        })
+        print(f"  iteration {it}: priced {len(priced_this_iter)}, new {n_new}, pool size {len(pool)}")
+
+        if n_new == 0:
+            print(f"  Converged after {it} iteration(s) -- stopping early.")
+            break
+
+    _frame_pool_growth(iteration_log, output_dir, formats)
+    _frame_dual_evolution(dual_history, sorted(detail_nodes), depot_idx, output_dir, formats)
     _frame_reduced_cost_histogram(all_truncations_for_stats, output_dir, formats)
 
-    full_pool = cg._dedupe_columns(initial_columns + all_priced)
-    print(f"  pool size after dedupe: {len(full_pool)}")
-
-    # --- Round 2 ---
-    print("Step 4: Round-2 binary ILP master solve...")
-    status2, selected_idx, _, _ = cg._solve_master(full_pool, list(range(n)), relaxation=False)
-    if status2 == "Optimal" and selected_idx:
+    full_pool = pool
+    print(f"Final pool size: {len(full_pool)}. Solving final ILP master...")
+    status_final, selected_idx, _, _ = cg._solve_master(full_pool, list(range(n)), relaxation=False)
+    if status_final == "Optimal" and selected_idx:
         selected_columns = [full_pool[i] for i in selected_idx]
     else:
-        warnings.warn(f"Round-2 status '{status2}'; using greedy fallback for this visualization.")
+        warnings.warn(f"Final master status '{status_final}'; using greedy fallback for this visualization.")
         selected_columns = cg._greedy_set_cover_fallback(full_pool, list(range(n)))
-    print(f"  status={status2}, segments selected={len(selected_columns)}")
+    print(f"  status={status_final}, segments selected={len(selected_columns)}")
     _frame_final_master(coords, depot_idx, selected_columns, len(full_pool), output_dir, formats)
 
-    # --- Concatenation ---
-    print("Step 5: Concatenating segments...")
+    print("Concatenating segments...")
     raw_tour = cg._concatenate_segments(selected_columns, depot_idx, matrix)
     raw_cost = cg._open_path_cost(raw_tour, matrix)
     _frame_concatenation(coords, depot_idx, selected_columns, raw_tour, matrix, output_dir, formats)
 
-    # --- 2-opt ---
-    print("Step 6: 2-opt polish...")
+    print("Running 2-opt polish...")
     final_tour = cg._two_opt_open_tsp(raw_tour, matrix)
     final_cost = cg._open_path_cost(final_tour, matrix)
     _frame_two_opt_before_after(coords, depot_idx, raw_tour, final_tour, raw_cost, final_cost, output_dir, formats)
 
-    print(f"\nDone in {time.time()-t_start:.2f}s. Raw cost {raw_cost:.2f} -> Final cost {final_cost:.2f} "
+    print(f"\nDone in {time.time()-t_start:.2f}s over {len(iteration_log)} iteration(s). "
+          f"Raw cost {raw_cost:.2f} -> Final cost {final_cost:.2f} "
           f"({100*(raw_cost-final_cost)/raw_cost:.1f}% from 2-opt). Frames saved under '{output_dir}/'")
 
     return {
@@ -474,7 +700,8 @@ def visualize_cg_stepwise_execution(
         "final_cost": final_cost,
         "raw_tour": raw_tour,
         "raw_cost": raw_cost,
-        "duals": duals,
+        "iteration_log": iteration_log,
+        "dual_history": dual_history,
         "num_pool_columns": len(full_pool),
         "num_segments_selected": len(selected_columns),
     }
@@ -484,5 +711,6 @@ if __name__ == "__main__":
     data = generate_random_tsp_data(n_nodes=16, seed=101)
     visualize_cg_stepwise_execution(
         data, qubit_count=4, exploration_percent=0.2, xy_mixer=False,
-        only_improving_columns=True, max_detail_nodes=6, seed=101,
+        only_improving_columns=True, n_iterations=ITERATION_CG,
+        max_detail_nodes=6, seed=101,
     )

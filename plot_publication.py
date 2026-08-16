@@ -36,7 +36,6 @@ import os
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
 
 # ---------------------------------------------------------------------
@@ -77,36 +76,71 @@ def _style_axes(ax):
     ax.set_aspect("equal", adjustable="datalim")
 
 
-def _plot_directional_route(ax, path_coords, cmap_name, linewidth=2.6, zorder=3):
+def _plot_directional_route(ax, path_coords, color, linewidth=1.5, zorder=3, n_arrows=6):
     """
-    Draws `path_coords` (an (N,2) array in visit order) as a line whose
-    color progresses along a colormap from the route's start to its end,
-    so direction of travel is visible at a glance. Returns the
-    LineCollection (useful for adding a colorbar if desired).
+    Draws `path_coords` (an (N,2) array in visit order) as a single flat,
+    fully-opaque, solid-color line -- no color/opacity gradient. Direction
+    of travel is shown ONLY via a handful of arrowheads along the path.
+
+    FIX (round 2): a previous version faded brightness from t=0.15 to
+    0.95 along a colormap, which made the start of routes look faint or
+    invisible. A narrower fade (0.55-1.0) was tried next, but any
+    gradient at all still reads as "parts of the line have different
+    opacity" on real, denser routes -- which is exactly what was flagged
+    as still wrong. There is now no gradient of any kind: one solid
+    color, drawn with a thin (not thick) linewidth per request, and
+    arrowheads for direction instead of a brightness cue.
     """
     if len(path_coords) < 2:
         return None
+
+    ax.plot(
+        path_coords[:, 0], path_coords[:, 1], "-",
+        color=color, linewidth=linewidth, alpha=1.0,
+        solid_capstyle="round", solid_joinstyle="round", zorder=zorder,
+    )
+
+    # Direction arrows: a handful of fixed-size arrowheads along the path,
+    # scaled to the plot's own extent so they look consistent regardless
+    # of the route's coordinate range. Same solid color as the line.
     pts = path_coords.reshape(-1, 1, 2)
     segments = np.concatenate([pts[:-1], pts[1:]], axis=1)
-    t = np.linspace(0.15, 0.95, len(segments))  # avoid the very-lightest end of the cmap
-    lc = LineCollection(segments, cmap=cmap_name, linewidth=linewidth, zorder=zorder)
-    lc.set_array(t)
-    ax.add_collection(lc)
-    ax.autoscale_view()
-    return lc
+    n_seg = len(segments)
+
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    diag = float(np.hypot(xlim[1] - xlim[0], ylim[1] - ylim[0]))
+    arrow_len = diag * 0.028
+
+    idxs = sorted(set(np.linspace(0, n_seg - 1, min(n_arrows, n_seg)).astype(int).tolist()))
+    for i in idxs:
+        p0, p1 = segments[i]
+        direction = p1 - p0
+        norm = float(np.hypot(*direction))
+        if norm < 1e-9:
+            continue
+        unit = direction / norm
+        mid = (p0 + p1) / 2.0
+        tail = mid - unit * arrow_len / 2.0
+        head = mid + unit * arrow_len / 2.0
+        ax.annotate(
+            "", xy=tuple(head), xytext=tuple(tail),
+            arrowprops=dict(arrowstyle="-|>", color=color, lw=1.6, mutation_scale=13),
+            zorder=zorder + 1,
+        )
+    return None
 
 
 def _mark_start_end(ax, path_coords, color, zorder=6):
     if len(path_coords) < 1:
         return
-    ax.scatter(*path_coords[0], marker="^", s=140, c=color, edgecolors="white",
+    ax.scatter(*path_coords[0], marker="^", s=190, c=color, edgecolors="white",
                linewidths=1.2, zorder=zorder, label="_nolegend_")
     if len(path_coords) > 1:
-        ax.scatter(*path_coords[-1], marker="s", s=110, c=color, edgecolors="white",
+        ax.scatter(*path_coords[-1], marker="s", s=155, c=color, edgecolors="white",
                    linewidths=1.2, zorder=zorder, label="_nolegend_")
 
 
-def _annotate_sparse(ax, coords, indices, max_labels=30, fontsize=6.5, always_include=()):
+def _annotate_sparse(ax, coords, indices, max_labels=30, fontsize=8, always_include=()):
     """
     Labels every node if there are few enough of them to stay readable;
     otherwise evenly subsamples down to ~max_labels, always keeping
@@ -134,12 +168,12 @@ def _annotate_sparse(ax, coords, indices, max_labels=30, fontsize=6.5, always_in
 def _route_panel(ax, coords, path_indices, cmap_name, route_color, title, cost,
                   depot_idx=None, max_labels=30):
     path_coords = coords[path_indices]
-    _plot_directional_route(ax, path_coords, cmap_name)
+    _plot_directional_route(ax, path_coords, route_color)
     _mark_start_end(ax, path_coords, route_color)
 
     if depot_idx is not None and depot_idx in path_indices:
         ax.scatter(coords[depot_idx, 0], coords[depot_idx, 1], c=COLOR_DEPOT,
-                   s=170, marker="D", edgecolors="white", linewidths=1.3,
+                   s=230, marker="D", edgecolors="white", linewidths=1.3,
                    zorder=8, label="Depot")
 
     always = {path_indices[0], path_indices[-1]}
@@ -147,7 +181,7 @@ def _route_panel(ax, coords, path_indices, cmap_name, route_color, title, cost,
         always.add(depot_idx)
     _annotate_sparse(ax, coords, path_indices, max_labels=max_labels, always_include=always)
 
-    ax.set_title(f"{title}\nCost: {cost:.2f}", fontsize=11)
+    ax.set_title(f"{title}\nCost: {cost:.2f}", fontsize=13)
     _style_axes(ax)
 
     legend_handles = [
@@ -172,12 +206,21 @@ def _save_all_formats(fig, path_no_ext, formats=("png", "pdf")):
 def generate_overall_visualizations(
     data, hybrid_tour, hybrid_cost, param_str, output_dir,
     max_node_labels=30, formats=("png", "pdf"),
+    algo_label="Hybrid Algo 2+5", algo_cmap=CMAP_HYBRID, algo_color="#1a6b1a",
 ):
     """
     Publication-quality side-by-side comparison plots between Amazon
-    Planned and Hybrid QAOA. Same signature/output layout as the
-    original: writes into `plots_with_depot/` and `plots_without_depot/`
-    under `output_dir`.
+    Planned and a second algorithm's tour. Same signature/output layout
+    as the original: writes into `plots_with_depot/` and
+    `plots_without_depot/` under `output_dir`.
+
+    `algo_label`/`algo_cmap`/`algo_color` identify the second algorithm
+    in titles and give it its own color identity -- default matches the
+    original Hybrid Algo 2+5 look exactly, so existing callers (e.g.
+    run_amazon_experiment.py) are unaffected. Other callers (e.g.
+    run_CG_experiment.py) should pass their own algo_label/colors so the
+    right panel is correctly labeled instead of silently showing
+    "Hybrid Algo 2+5" for a different algorithm's results.
     """
     from algo_data_loader import compute_open_route_cost  # single source of truth
 
@@ -197,18 +240,18 @@ def generate_overall_visualizations(
     filename_slug = f"{route_id}_{param_str}"
 
     # ------------------ 1. WITH DEPOT ------------------
-    fig, axes = plt.subplots(1, 2, figsize=(13, 6.2))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7.8))
     _route_panel(axes[0], coords, amazon_tour, CMAP_AMAZON, "#1f4e79",
                  "Amazon Planned (With Depot)", amazon_cost, depot_idx=depot_idx,
                  max_labels=max_node_labels)
-    _route_panel(axes[1], coords, hybrid_tour, CMAP_HYBRID, "#1a6b1a",
-                 "Hybrid Algo 2+5 (With Depot)", hybrid_cost, depot_idx=depot_idx,
+    _route_panel(axes[1], coords, hybrid_tour, algo_cmap, algo_color,
+                 f"{algo_label} (With Depot)", hybrid_cost, depot_idx=depot_idx,
                  max_labels=max_node_labels)
 
     improvement_pct = -100.0 * (hybrid_cost - amazon_cost) / amazon_cost if amazon_cost else 0.0
     fig.suptitle(
         f"Route {route_id}  \u2022  {n_stops} stops  \u2022  "
-        f"{'Hybrid faster' if improvement_pct > 0 else 'Amazon faster'} by "
+        f"{algo_label + ' faster' if improvement_pct > 0 else 'Amazon faster'} by "
         f"{abs(improvement_pct):.1f}%\nParameters: {param_str}",
         fontsize=13, y=0.99,
     )
@@ -220,12 +263,12 @@ def generate_overall_visualizations(
     amazon_no_depot = [i for i in amazon_tour if i != depot_idx]
     hybrid_no_depot = [i for i in hybrid_tour if i != depot_idx]
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 6.2))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7.8))
     _route_panel(axes[0], coords, amazon_no_depot, CMAP_AMAZON, "#1f4e79",
                  "Amazon Planned (Delivery Stops Only)", amazon_cost, depot_idx=None,
                  max_labels=max_node_labels)
-    _route_panel(axes[1], coords, hybrid_no_depot, CMAP_HYBRID, "#1a6b1a",
-                 "Hybrid Algo 2+5 (Delivery Stops Only)", hybrid_cost, depot_idx=None,
+    _route_panel(axes[1], coords, hybrid_no_depot, algo_cmap, algo_color,
+                 f"{algo_label} (Delivery Stops Only)", hybrid_cost, depot_idx=None,
                  max_labels=max_node_labels)
 
     fig.suptitle(

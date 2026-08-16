@@ -10,12 +10,16 @@ of duplicating plotting code.
 
 Grid parameters (no batch_count here -- the CG algorithm has no
 receding-horizon batching concept; coverage is decided by the master
-problem in one shot):
+problem after ITERATION_CG pricing rounds):
   - qubit_count: [2, 3, 4]
   - exploration_percent: [0.0, 0.2]
   - xy_mixer: [False]  (True left available but off by default, matching
     run_amazon_experiment.py's current default)
   - only_improving_columns: [True]
+
+n_iterations defaults to cg_hybrid_lrwsqaoa_sub.ITERATION_CG (currently
+10), imported from there rather than redefined here so the two files
+can't silently drift; override per-run with --iterations.
 """
 
 # --- CRITICAL CPU & THERMAL LIMITS (matches run_amazon_experiment.py) ---
@@ -38,7 +42,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 from algo_data_loader import AmazonDataLoader, compute_open_route_cost
-from cg_hybrid_lrwsqaoa_sub import run_cg_hybrid_lrwsqaoa_sub
+from cg_hybrid_lrwsqaoa_sub import run_cg_hybrid_lrwsqaoa_sub, ITERATION_CG
 from plot_publication import generate_overall_visualizations
 
 
@@ -96,6 +100,7 @@ def run_cg_experiment_grid(
     xy_mixers=(False,),
     only_improving_columns_options=(True,),
     max_pricing_nodes=None,
+    n_iterations=ITERATION_CG,
     time_limit=60,
     output_dir="./experiment_results_cg",
     seed=2026,
@@ -117,6 +122,7 @@ def run_cg_experiment_grid(
         f"\n=== Starting CG Grid Search Benchmark ==="
         f"\n  Routes Sampled     : {len(routes_data)}"
         f"\n  Valid Grid Combos  : {len(param_grid)}"
+        f"\n  Pricing Iterations : {n_iterations} (per run, cap; may converge earlier)"
         f"\n  Total Iterations   : {total_runs}\n"
     )
 
@@ -148,6 +154,7 @@ def run_cg_experiment_grid(
                         xy_mixer=xy,
                         only_improving_columns=only_improving,
                         max_pricing_nodes=max_pricing_nodes,
+                        n_iterations=n_iterations,
                         time_limit=time_limit,
                         seed=seed,
                     )
@@ -191,17 +198,17 @@ def run_cg_experiment_grid(
                 "exploration_percent": exp,
                 "xy_mixer": xy,
                 "only_improving_columns": only_improving,
+                "n_iterations_cap": n_iterations,
                 "amazon_cost": round(amazon_cost, 2),
                 "cg_cost": round(cg_cost, 2),
                 "cost_diff_abs": round(cost_diff_abs, 2),
                 "cost_diff_pct": round(cost_diff_pct, 2),
                 "improvement_pct": round(improvement_pct, 2),
                 "runtime_sec": round(elapsed, 3),
-                "num_priced_columns": diag["num_priced_columns"],
-                "num_pool_columns": diag["num_pool_columns_after_dedupe"],
+                "num_iterations_run": diag["num_iterations_run"],
+                "num_pool_columns_final": diag["num_pool_columns_final"],
                 "num_segments_selected": diag["num_segments_selected"],
-                "round1_lp_status": diag["round1_lp_status"],
-                "round2_master_status": diag["round2_master_status"],
+                "final_master_status": diag["final_master_status"],
                 "pre_2opt_cost": round(diag["pre_2opt_cost"], 2),
                 "error": None,
             })
@@ -209,12 +216,16 @@ def run_cg_experiment_grid(
             print(
                 f"[{run_counter}/{total_runs}] Route {route_id} ({r_idx}/{len(routes_data)}) | "
                 f"Params: {param_str} | Amazon: {amazon_cost:.2f} | CG: {cg_cost:.2f} | "
-                f"Improv: {improvement_pct:+.2f}% | Segments: {diag['num_segments_selected']} | "
-                f"Time: {elapsed:.2f}s"
+                f"Improv: {improvement_pct:+.2f}% | Iters: {diag['num_iterations_run']}/{n_iterations} | "
+                f"Segments: {diag['num_segments_selected']} | Time: {elapsed:.2f}s"
             )
 
             if generate_plots:
-                generate_overall_visualizations(data, cg_tour, cg_cost, param_str, output_dir)
+                generate_overall_visualizations(
+                    data, cg_tour, cg_cost, param_str, output_dir,
+                    algo_label="CG Hybrid (LRWSQAOA-Sub)",
+                    algo_cmap="Purples", algo_color="#6a3d9a",
+                )
 
         gc.collect()
 
@@ -233,6 +244,7 @@ def run_cg_experiment_grid(
                 mean_improvement_pct=("improvement_pct", "mean"),
                 win_rate_pct=("improvement_pct", lambda x: (x > 0).mean() * 100),
                 mean_segments_selected=("num_segments_selected", "mean"),
+                mean_iterations_run=("num_iterations_run", "mean"),
                 mean_runtime_sec=("runtime_sec", "mean"),
             )
             .reset_index()
@@ -270,6 +282,10 @@ if __name__ == "__main__":
         "--max-pricing-nodes", type=int, default=None,
         help="Subsample this many starting nodes for pricing instead of every node (speed/quality tradeoff)",
     )
+    parser.add_argument(
+        "--iterations", type=int, default=ITERATION_CG,
+        help=f"Number of CG pricing iterations before the final ILP round (default: ITERATION_CG={ITERATION_CG})",
+    )
     parser.add_argument("--time-limit", type=int, default=60, help="CBC solver time limit (seconds) per master solve")
 
     args = parser.parse_args()
@@ -282,6 +298,7 @@ if __name__ == "__main__":
         xy_mixers=(False,),
         only_improving_columns_options=(True,),
         max_pricing_nodes=args.max_pricing_nodes,
+        n_iterations=args.iterations,
         time_limit=args.time_limit,
         output_dir=args.output_dir,
         seed=args.seed,

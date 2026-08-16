@@ -18,35 +18,92 @@ column), minimizing total column cost:
 
     minimize   sum_p  cost(p) * x_p
     subject to sum_{p : i in p} x_p == 1   for every node i
-               x_p in [0,1]  (round 1, LP relaxation)  /  {0,1} (round 2)
+               x_p in [0,1]  (pricing iterations, LP relaxation)
+               x_p in {0,1}  (final round)
 
-This is genuinely only TWO master solves, as specified:
+--------------------------------------------------------------------------
+ITERATION_CG
+--------------------------------------------------------------------------
+The number of pricing iterations is controlled by the module-level
+constant ITERATION_CG (default 10, overridable per-call via
+`n_iterations`). Each iteration:
 
-  Round 1 (LP relaxation): solved with a trivial initial column pool
-  (one singleton column per node, cost 0) purely to obtain dual prices
-  pi_i for each node's covering constraint. This is not meant to be a
-  good solution on its own -- singleton columns are a feasibility floor.
+  1. Solves the master as an LP relaxation over the CURRENT column pool
+     to get fresh duals pi_i.
+  2. Prices new columns against those duals: for EVERY node i as a
+     candidate segment start, take its qubit_count nearest (+
+     exploration) neighbors, run the existing
+     solve_wslr_qaoa_subtour(i, candidates, matrix) to get an ordered
+     sub-tour, and form the full column [i] + subtour. Every prefix of
+     it is priced as its own column -- e.g. for full column [2, 4, 9, 1]:
+     [2, 4, 9, 1], [2, 4, 9], [2, 4], [2] -- each with reduced cost
+     (cost - sum of duals of its nodes) computed against THIS
+     iteration's duals. Only improving (reduced_cost < 0) columns are
+     kept by default (`only_improving_columns=True`); the length-1
+     singleton is always kept regardless, as a feasibility safety net.
+  3. Newly-priced columns are deduplicated against the existing pool
+     (by node sequence) and merged in -- the pool only grows, columns
+     are never removed, exactly as in standard column generation.
 
-  Pricing (heuristic, not exact): for EVERY node i as a candidate
-  segment start, take its qubit_count nearest (+ exploration) neighbors
-  as candidates, run the existing solve_wslr_qaoa_subtour(i, candidates,
-  matrix) to get an ordered sub-tour, and form the full column
-  [i] + subtour. Rather than adding only that one path, every prefix of
-  it is added as its own column -- e.g. for full column [2, 4, 9, 1]:
-  [2, 4, 9, 1], [2, 4, 9], [2, 4], [2]. Each prefix's reduced cost
-  (cost - sum of duals of its nodes) is computed using the Round-1
-  duals, and only improving (reduced_cost < 0) columns are kept by
-  default -- this mimics the spirit of CG pricing even though the QAOA
-  solver isn't literally minimizing reduced cost, it's just evaluated
-  after the fact. The original singleton columns are always kept too,
-  as a feasibility safety net.
+  Note that with exploration_percent=0 the QAOA call itself is fully
+  deterministic (same candidates -> same sub-tour every time), so
+  re-running iterations doesn't rediscover new PATHS on its own -- what
+  changes each iteration is which of those already-known truncations
+  clear the reduced-cost bar, since the duals themselves evolve as the
+  pool grows and the LP relaxation's chosen basis shifts. Set
+  exploration_percent > 0 to also get genuinely new candidate sets
+  across iterations (more diverse columns, not just a moving filter
+  over the same fixed candidates).
 
-  Round 2 (final, integer): solve the master AGAIN, now as a binary ILP
-  over the enlarged pool (initial + priced columns), to get an exact
-  0/1 partition. The selected columns are then chained into a single
-  Open TSP tour (the depot's column goes first; remaining columns are
-  greedily chained by nearest segment-start to the current tour's last
-  node) and polished with the same style of 2-opt local search used in
+  CANDIDATE SELECTION (from iteration >= 2): candidate selection for the
+  "nearest" slice is plain closest-by-distance on iteration 1 (duals are
+  still just the naive distance-from-depot seed there, not informative
+  enough to use yet -- see _build_initial_columns). From iteration 2
+  onward, once duals reflect real priced structure:
+    - Every candidate in the pool (subject to RADIUS_POOL_SEARCH, see
+      below) gets a reduced cost computed:
+      matrix[curr_node, x] - duals.get(x, 0).
+    - The "nearest" slice takes the qubit_count candidates with the
+      SMALLEST reduced cost (ranked ascending, not filtered by sign --
+      unlike an earlier version of this file, a candidate is not
+      required to have negative reduced cost to be selected, just to be
+      among the best available). This guarantees a full qubit_count-sized
+      "nearest" set whenever the pool has enough points, instead of
+      shrinking whenever few candidates happen to be strictly negative.
+    - The QAOA subproblem itself also incorporates duals from iteration
+      2 onward: instead of solving over the raw distance matrix, it
+      solves over a dual-adjusted matrix (matrix[i, j] - duals[j] for
+      every j), so QAOA is searching for low REDUCED-cost orderings of
+      the chosen candidates, not merely short ones. This only affects
+      the QAOA call itself -- every cost bookkeeping computation
+      (column cost, reduced cost filtering, final tour cost) continues
+      to use the raw, unadjusted matrix.
+  Every node gets its own independent candidate search each iteration --
+  there is no shared "used" or "unvisited" set depleting across
+  different starting nodes within an iteration. All n nodes are always
+  pricing starts (see _generate_priced_columns's start_nodes), and every
+  one of them searches the (nearly) full node universe on its own terms.
+
+  RADIUS_POOL_SEARCH (module constant, default 1.0): restricts the
+  candidate pool used for the reduced-cost ranking above to nodes within
+  RADIUS_POOL_SEARCH * (largest pairwise distance in the whole matrix)
+  of curr_node. At the default of 1.0 this is a no-op -- no pairwise
+  distance can exceed the matrix's own global maximum, so every node is
+  always in range and the full point set is searched, as it always has
+  been. Lowering it restricts the search to a smaller spatial
+  neighborhood, which is a lever for large instances, not something
+  currently changing behavior at the default.
+
+  Iterations stop early if a pass adds zero new columns to the pool
+  (converged -- further iterations would be identical) or once
+  `n_iterations` is reached, whichever comes first.
+
+  Final round (integer): solve the master ONE more time, now as a
+  binary ILP over the final pool, to get an exact 0/1 partition. The
+  selected columns are then chained into a single Open TSP tour (the
+  depot's column goes first; remaining columns are greedily chained by
+  nearest segment-start to the current tour's last node) and polished
+  with the same style of 2-opt local search used in
   algo_hybrid_LRWSQAOA.py (reimplemented here rather than imported,
   since it isn't exposed as a standalone function there and that file
   is not to be modified).
@@ -65,12 +122,15 @@ the depot has it as nodes[0], and that column is used to open the tour.
 PERFORMANCE NOTE
 --------------------------------------------------------------------------
 "Every data point" as a pricing start means O(n) QAOA subproblem solves
-for the pricing round (one per node), each on a qubit_count-sized
-sub-problem -- similar order of magnitude to the original algorithm run
-with batch_count=1. For real Amazon routes (100-250+ stops) this is not
-free; `max_pricing_nodes` lets you subsample starting nodes instead of
-using literally every one, if a full run is too slow. Default is None
-(use every node), matching what was asked for.
+per iteration (one per node), each on a qubit_count-sized sub-problem --
+similar order of magnitude to the original algorithm run with
+batch_count=1. With ITERATION_CG pricing iterations, total QAOA calls
+scale as O(ITERATION_CG * n) -- at the default of 10 iterations, that's
+roughly 10x the pricing cost of the original 2-round version. For real
+Amazon routes (100-250+ stops) this is not free; `max_pricing_nodes`
+lets you subsample starting nodes per iteration instead of using
+literally every one, and lowering ITERATION_CG is the other direct
+lever if a run is too slow.
 --------------------------------------------------------------------------
 """
 
@@ -87,6 +147,24 @@ except ImportError:
 
 from algo_hybrid_LRWSQAOA import solve_wslr_qaoa_subtour
 
+# Number of pricing iterations (LP relaxation for duals -> price -> grow
+# pool) run before the single final integer master solve. Override
+# per-call via run_cg_hybrid_lrwsqaoa_sub(..., n_iterations=...); this is
+# just the default, and the single source of truth other modules
+# (run_CG_experiment.py, visualize_step_by_step_CG.py) import rather than
+# redefining locally.
+ITERATION_CG = 10
+
+# Restricts the candidate pool used for reduced-cost ranking (see
+# _dual_aware_nearest_and_explore) to nodes within
+# RADIUS_POOL_SEARCH * (largest pairwise distance in the whole matrix)
+# of the current search point. Default 1.0 = no restriction, since no
+# pairwise distance can exceed the matrix's own global maximum -- every
+# node is always in range, matching "use all points" behavior. Lower
+# values restrict the search to a smaller spatial neighborhood; this is
+# a lever for large instances, not something changing behavior today.
+RADIUS_POOL_SEARCH = 1.0
+
 
 # =====================================================================
 # Small shared helpers
@@ -98,30 +176,86 @@ def _open_path_cost(nodes, matrix):
     return float(sum(matrix[nodes[i], nodes[i + 1]] for i in range(len(nodes) - 1)))
 
 
-def _nearest_and_explore_candidates(curr_node, exclude, matrix, k, exploration_percent, rng):
+def _dual_aware_nearest_and_explore(curr_node, exclude, matrix, k, exploration_percent, rng,
+                                     duals=None, global_max_dist=None):
+    """
+    Selects up to k candidates for curr_node's QAOA pricing subproblem,
+    returned as (nearest, explore). Every call searches this curr_node's
+    OWN candidate pool independently -- there is no shared "used" state
+    across different starting nodes, so every node's search always sees
+    the (nearly) full point set, never a pool depleted by some other
+    node's earlier selection. This is a two-phase search:
+
+      Phase 0 (duals is None -- iteration 1 / "iteration 0"): nearest is
+      plain closest-by-distance over ALL other nodes in the graph.
+      Iteration 1's duals are just the naive distance-from-depot seed
+      (see _build_initial_columns), not yet meaningful enough to use.
+
+      Phase 1+ (duals provided -- iteration >= 2 / "iteration 1" in the
+      zero-indexed sense): every node in the candidate pool (optionally
+      narrowed by RADIUS_POOL_SEARCH, see below) gets a reduced cost
+      matrix[curr_node, x] - duals.get(x, 0). Candidates are RANKED by
+      this value ascending and the k smallest are taken as "nearest" --
+      this is a ranking, not a sign filter. A candidate does not need
+      negative reduced cost to be selected, only to be among the best
+      available. This guarantees a full k-sized "nearest" set whenever
+      the pool has at least k points, rather than shrinking whenever few
+      candidates happen to be strictly negative.
+
+    RADIUS_POOL_SEARCH (module constant): when duals is provided and
+    global_max_dist is given, the pool considered for ranking is first
+    narrowed to nodes with matrix[curr_node, x] <= RADIUS_POOL_SEARCH *
+    global_max_dist. At the default RADIUS_POOL_SEARCH=1.0 this never
+    excludes anyone (no pairwise distance can exceed the matrix's own
+    global maximum), so today this is a no-op and the full point set is
+    always searched.
+
+    exploration_percent alone controls how many exploration slots exist;
+    this function never inflates that count to compensate for anything.
+    """
     n = matrix.shape[0]
     others = [i for i in range(n) if i != curr_node and i not in exclude]
     if not others:
-        return []
+        return [], []
     others_sorted = sorted(others, key=lambda x: (matrix[curr_node, x], x))
     k = min(k, len(others_sorted))
 
     if exploration_percent <= 0.0 or k <= 1:
-        return others_sorted[:k]
+        n_nearest, n_explore = k, 0
+    else:
+        n_explore = int(math.floor(k * exploration_percent))
+        if n_explore >= k:
+            n_explore = k - 1
+        n_nearest = k - n_explore
 
-    n_explore = int(math.floor(k * exploration_percent))
-    if n_explore >= k:
-        n_explore = k - 1
-    n_nearest = k - n_explore
+    if duals is not None:
+        if global_max_dist is not None and global_max_dist > 0:
+            radius = RADIUS_POOL_SEARCH * global_max_dist
+            pool = [x for x in others if matrix[curr_node, x] <= radius]
+            if not pool:
+                pool = others  # radius somehow excluded everyone -- don't strand the search
+        else:
+            pool = others
+        ranked = sorted(pool, key=lambda x: (matrix[curr_node, x] - duals.get(x, 0.0), matrix[curr_node, x], x))
+        nearest = ranked[:n_nearest]
+    else:
+        nearest = others_sorted[:n_nearest]
 
-    nearest = others_sorted[:n_nearest]
-    remaining = others_sorted[n_nearest:]
+    remaining = [x for x in others_sorted if x not in nearest]
     if n_explore > 0 and remaining:
         n_pick = min(n_explore, len(remaining))
         idx = rng.choice(len(remaining), size=n_pick, replace=False)
         explore = [remaining[i] for i in idx]
     else:
         explore = []
+    return nearest, explore
+
+
+def _nearest_and_explore_candidates(curr_node, exclude, matrix, k, exploration_percent, rng,
+                                     duals=None, global_max_dist=None):
+    nearest, explore = _dual_aware_nearest_and_explore(
+        curr_node, exclude, matrix, k, exploration_percent, rng, duals, global_max_dist
+    )
     return nearest + explore
 
 
@@ -288,12 +422,29 @@ def _build_initial_columns(n, matrix, depot_idx):
 
 def _generate_priced_columns(
     matrix, depot_idx, duals, qubit_count, exploration_percent, xy_mixer,
-    only_improving_columns, max_pricing_nodes, rng,
+    only_improving_columns, max_pricing_nodes, rng, apply_dual_candidate_filter=False,
+    global_max_dist=None,
 ):
     n = matrix.shape[0]
     start_nodes = list(range(n))
     if max_pricing_nodes is not None and max_pricing_nodes < n:
         start_nodes = list(rng.choice(n, size=max_pricing_nodes, replace=False))
+
+    candidate_duals = duals if apply_dual_candidate_filter else None
+
+    # QAOA itself incorporates duals from iteration >= 2 onward, matching
+    # when candidate selection starts using them: the matrix handed to
+    # solve_wslr_qaoa_subtour has every column j reduced by duals[j], so
+    # QAOA searches for low REDUCED-cost orderings of the given
+    # candidates, not merely geometrically short ones. This is the only
+    # place duals affect the matrix -- every cost bookkeeping computation
+    # below (column cost, reduced cost, dedup, master objective) keeps
+    # using the raw, unadjusted `matrix`.
+    if apply_dual_candidate_filter:
+        duals_vector = np.array([duals.get(j, 0.0) for j in range(n)])
+        qaoa_matrix = matrix - duals_vector[np.newaxis, :]
+    else:
+        qaoa_matrix = matrix
 
     priced = []
     for curr_node in start_nodes:
@@ -303,13 +454,14 @@ def _generate_priced_columns(
             continue
 
         candidates = _nearest_and_explore_candidates(
-            curr_node, exclude, matrix, k_batch, exploration_percent, rng
+            curr_node, exclude, matrix, k_batch, exploration_percent, rng,
+            duals=candidate_duals, global_max_dist=global_max_dist,
         )
         if not candidates:
             continue
 
         try:
-            subtour = solve_wslr_qaoa_subtour(curr_node, candidates, matrix, xy_mixer=xy_mixer)
+            subtour = solve_wslr_qaoa_subtour(curr_node, candidates, qaoa_matrix, xy_mixer=xy_mixer)
         except RuntimeError:
             raise  # e.g. Qiskit missing -- surface this clearly, don't swallow it
         if not subtour:
@@ -318,7 +470,7 @@ def _generate_priced_columns(
         full_nodes = [curr_node] + subtour
         for L in range(len(full_nodes), 0, -1):
             seg = full_nodes[:L]
-            cost = _open_path_cost(seg, matrix)
+            cost = _open_path_cost(seg, matrix)  # raw matrix -- real cost, not dual-adjusted
             reduced_cost = cost - sum(duals.get(node, 0.0) for node in seg)
             if only_improving_columns and reduced_cost >= -1e-9 and L > 1:
                 # Still keep the length-1 (singleton) truncation regardless --
@@ -394,13 +546,16 @@ def run_cg_hybrid_lrwsqaoa_sub(
     max_pricing_nodes=None,
     time_limit=60,
     seed=None,
+    n_iterations=ITERATION_CG,
 ):
     """
     Column-generation Open TSP solver: PuLP set-partitioning master problem
     + WS-LR QAOA sub-tour solver as the (heuristic) pricing subproblem.
-    Exactly two master solves: an LP relaxation for duals, then a final
-    binary ILP over the enlarged column pool. Returns the same shape of
-    result dict as run_algo_hybrid_2_5, plus CG-specific diagnostics.
+    Runs `n_iterations` pricing iterations (LP relaxation for duals ->
+    price -> grow pool), stopping early if a pass adds no new columns,
+    then ONE final binary ILP over the accumulated pool. Returns the same
+    shape of result dict as run_algo_hybrid_2_5, plus CG-specific
+    diagnostics including a per-iteration log.
     """
     if seed is not None:
         random.seed(seed)
@@ -412,31 +567,51 @@ def run_cg_hybrid_lrwsqaoa_sub(
     depot_idx = data.get("depot_idx", 0)
     qubit_count = max(1, qubit_count)
     exploration_percent = max(0.0, min(1.0, exploration_percent))
+    n_iterations = max(1, n_iterations)
 
     node_ids = list(range(n))
+    global_max_dist = float(matrix.max()) if n > 1 else 0.0
 
-    # --- Round 1: LP relaxation on trivial columns, to get duals ---
-    initial_columns = _build_initial_columns(n, matrix, depot_idx)
-    status1, _, _, duals = _solve_master(initial_columns, node_ids, relaxation=True, time_limit=time_limit)
-    if status1 not in ("Optimal", "Not Solved"):
-        warnings.warn(f"Round-1 LP relaxation status was '{status1}' (expected 'Optimal').")
+    # --- Pricing iterations: LP relaxation for duals -> price -> grow pool ---
+    pool = _build_initial_columns(n, matrix, depot_idx)
+    duals = {}
+    iteration_log = []
 
-    # --- Pricing: QAOA-generated columns, priced against Round-1 duals ---
-    priced_columns = _generate_priced_columns(
-        matrix, depot_idx, duals, qubit_count, exploration_percent, xy_mixer,
-        only_improving_columns, max_pricing_nodes, rng,
-    )
+    for it in range(1, n_iterations + 1):
+        status_lp, _, _, duals = _solve_master(pool, node_ids, relaxation=True, time_limit=time_limit)
+        if status_lp not in ("Optimal", "Not Solved"):
+            warnings.warn(f"Iteration {it}: LP relaxation status was '{status_lp}' (expected 'Optimal').")
 
-    full_pool = _dedupe_columns(initial_columns + priced_columns)
+        priced_columns = _generate_priced_columns(
+            matrix, depot_idx, duals, qubit_count, exploration_percent, xy_mixer,
+            only_improving_columns, max_pricing_nodes, rng,
+            apply_dual_candidate_filter=(it >= 2), global_max_dist=global_max_dist,
+        )
+        pool_before = len(pool)
+        pool = _dedupe_columns(pool + priced_columns)
+        n_new = len(pool) - pool_before
 
-    # --- Round 2 (final): binary ILP over the enlarged pool ---
-    status2, selected_idx, _, _ = _solve_master(full_pool, node_ids, relaxation=False, time_limit=time_limit)
+        iteration_log.append({
+            "iteration": it,
+            "lp_status": status_lp,
+            "num_priced": len(priced_columns),
+            "num_new_columns": n_new,
+            "pool_size": len(pool),
+        })
 
-    if status2 == "Optimal" and selected_idx:
+        if n_new == 0:
+            break  # converged: pool unchanged, further iterations would be identical
+
+    full_pool = pool
+
+    # --- Final round: binary ILP over the accumulated pool ---
+    status_final, selected_idx, _, _ = _solve_master(full_pool, node_ids, relaxation=False, time_limit=time_limit)
+
+    if status_final == "Optimal" and selected_idx:
         selected_columns = [full_pool[i] for i in selected_idx]
     else:
         warnings.warn(
-            f"Round-2 ILP master status was '{status2}'; falling back to a "
+            f"Final ILP master status was '{status_final}'; falling back to a "
             f"greedy set-cover over the same column pool to guarantee a "
             f"feasible tour."
         )
@@ -464,14 +639,16 @@ def run_cg_hybrid_lrwsqaoa_sub(
             "xy_mixer": xy_mixer,
             "only_improving_columns": only_improving_columns,
             "max_pricing_nodes": max_pricing_nodes,
+            "n_iterations": n_iterations,
         },
         "cg_diagnostics": {
-            "round1_lp_status": status1,
-            "round2_master_status": status2,
-            "num_initial_columns": len(initial_columns),
-            "num_priced_columns": len(priced_columns),
-            "num_pool_columns_after_dedupe": len(full_pool),
+            "num_iterations_run": len(iteration_log),
+            "iteration_log": iteration_log,
+            "final_master_status": status_final,
+            "num_initial_columns": n,
+            "num_pool_columns_final": len(full_pool),
             "num_segments_selected": len(selected_columns),
             "pre_2opt_cost": float(_open_path_cost(raw_tour, matrix)),
+            "final_duals": duals,
         },
     }
