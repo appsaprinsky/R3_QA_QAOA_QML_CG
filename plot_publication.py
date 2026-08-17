@@ -10,11 +10,10 @@ plots_without_depot), so switching to it is a one-line import change:
     from plot_publication import generate_overall_visualizations
 
 Design choices, and why:
-  - Route direction is shown with a gradient-colored line (dark -> light
-    along a perceptually-uniform colormap) instead of a flat color, so a
-    reader can tell which end is the start and which is the end without
-    needing to trace numbered labels. A flat "b-o" line looks identical
-    forwards and backwards.
+  - Route direction is shown as a single solid, fully-opaque color line
+    (no gradient/opacity fade -- an earlier version faded brightness
+    along the path, which read as "parts of the route are invisible" on
+    real, denser routes) plus a handful of arrowheads along its length.
   - Start and end stops get distinct markers (triangle / square) so the
     route's direction is legible even in black-and-white print.
   - Node-index labels are a big source of visual noise once a route has
@@ -167,6 +166,11 @@ def _annotate_sparse(ax, coords, indices, max_labels=30, fontsize=8, always_incl
 
 def _route_panel(ax, coords, path_indices, cmap_name, route_color, title, cost,
                   depot_idx=None, max_labels=30):
+    # NOTE: cmap_name is accepted but no longer used -- _plot_directional_route
+    # draws a solid `route_color` line now, not a colormap gradient (see its
+    # docstring). Kept in the signature only so existing callers that pass
+    # algo_cmap/CMAP_AMAZON/CMAP_HYBRID by keyword don't break; it has no
+    # effect on the rendered output.
     path_coords = coords[path_indices]
     _plot_directional_route(ax, path_coords, route_color)
     _mark_start_end(ax, path_coords, route_color)
@@ -214,13 +218,15 @@ def generate_overall_visualizations(
     as the original: writes into `plots_with_depot/` and
     `plots_without_depot/` under `output_dir`.
 
-    `algo_label`/`algo_cmap`/`algo_color` identify the second algorithm
-    in titles and give it its own color identity -- default matches the
-    original Hybrid Algo 2+5 look exactly, so existing callers (e.g.
+    `algo_label`/`algo_color` identify the second algorithm in titles and
+    give it its own color identity -- default matches the original
+    Hybrid Algo 2+5 look exactly, so existing callers (e.g.
     run_amazon_experiment.py) are unaffected. Other callers (e.g.
-    run_CG_experiment.py) should pass their own algo_label/colors so the
-    right panel is correctly labeled instead of silently showing
-    "Hybrid Algo 2+5" for a different algorithm's results.
+    run_CG_experiment.py) should pass their own algo_label/algo_color so
+    the right panel is correctly labeled instead of silently showing
+    "Hybrid Algo 2+5" for a different algorithm's results. algo_cmap is
+    accepted for backward compatibility but no longer affects rendering
+    (see _route_panel) -- only algo_color does.
     """
     from algo_data_loader import compute_open_route_cost  # single source of truth
 

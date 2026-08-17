@@ -21,7 +21,10 @@ single snapshot, then the final master solve:
   3. Pool growth across all iterations -- pool size and newly-added
      columns per iteration, so you can see when (or whether) pricing
      converges before hitting the iteration cap.
-  4. Dual evolution across all iterations, for the same sampled nodes --
+  4. Dual evolution across all iterations, for a small evenly-spaced
+     sample of nodes (this chart is a trend summary, not an exhaustive
+     per-node account like item 2 above -- plotting every node here
+     stops being readable long before n approaches real route sizes) --
      do the shadow prices stabilize, oscillate, or drift?
   5. A reduced-cost histogram across every priced column from every
      iteration.
@@ -529,10 +532,23 @@ def visualize_cg_stepwise_execution(
         detail_iterations = set(detail_iterations)
 
     if max_detail_nodes is None:
-        detail_nodes = set(range(n))  # every point, no sampling
+        detail_nodes = set(range(n))  # every point, no sampling -- used for pricing detail frames
     else:
         detail_nodes = set(np.linspace(0, n - 1, num=min(max_detail_nodes, n), dtype=int).tolist())
         detail_nodes.add(depot_idx)
+
+    # Deliberately SEPARATE from detail_nodes above. detail_nodes controls the
+    # per-node pricing frames and must stay exhaustive (every point, every
+    # iteration) -- that's a hard requirement, not a display convenience.
+    # This one is only for the dual-evolution SUMMARY chart (a trend line
+    # per node on one shared plot), where plotting all n nodes stops being
+    # readable well before n gets anywhere near real Amazon-route sizes: at
+    # n=40 the legend alone already swallows the chart. Capped at a small,
+    # evenly-spaced sample + depot regardless of how many points detail_nodes
+    # covers, since this chart's job is showing a representative trend, not
+    # an exhaustive per-node account (the pricing frames already are that).
+    dual_evolution_sample = set(np.linspace(0, n - 1, num=min(10, n), dtype=int).tolist())
+    dual_evolution_sample.add(depot_idx)
 
     t_start = time.time()
     pool = cg._build_initial_columns(n, matrix, depot_idx)
@@ -667,7 +683,7 @@ def visualize_cg_stepwise_execution(
             break
 
     _frame_pool_growth(iteration_log, output_dir, formats)
-    _frame_dual_evolution(dual_history, sorted(detail_nodes), depot_idx, output_dir, formats)
+    _frame_dual_evolution(dual_history, sorted(dual_evolution_sample), depot_idx, output_dir, formats)
     _frame_reduced_cost_histogram(all_truncations_for_stats, output_dir, formats)
 
     full_pool = pool
@@ -712,5 +728,14 @@ if __name__ == "__main__":
     visualize_cg_stepwise_execution(
         data, qubit_count=4, exploration_percent=0.2, xy_mixer=False,
         only_improving_columns=True, n_iterations=ITERATION_CG,
-        max_detail_nodes=6, seed=101,
+        seed=101,
+        # max_detail_nodes and detail_iterations intentionally NOT set here --
+        # leaving them at their function defaults (None) means every point at
+        # every iteration gets rendered, exactly as required. A previous
+        # version of this __main__ block hardcoded max_detail_nodes=6, which
+        # silently overrode the fixed default whenever this script was run
+        # directly (`python visualize_step_by_step_CG.py`) rather than
+        # imported and called from elsewhere -- that stale hardcoded value,
+        # not the function's actual default, is what was producing the
+        # sampled 0, 3, 6, 9... pattern.
     )
