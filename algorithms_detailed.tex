@@ -1,0 +1,257 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{physics}
+
+\newcommand{\Real}{\mathbb{R}}
+\newcommand{\ket}[1]{\left|#1\right\rangle}
+
+\title{Two Hybrid Quantum--Classical Heuristics for the Open Traveling Salesman Problem:\\
+Warm-Start Receding-Horizon QAOA and Column Generation with QAOA Pricing}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Problem Definition}
+\label{sec:problem}
+
+We consider the \emph{Open Traveling Salesman Problem} (Open TSP): given a depot node $d$ and a set of customer nodes $V = \{1, \dots, n-1\}$ (so the full node set is $\{0,\dots,n-1\}$ with $d=0$), and a cost matrix $C \in \Real^{n\times n}_{\ge 0}$ where $C_{ij}$ is the travel cost from node $i$ to node $j$, find a permutation $\pi = (\pi_0, \pi_1, \dots, \pi_{n-1})$ of $\{0,\dots,n-1\}$ with $\pi_0 = d$ minimizing
+\begin{equation}
+  \mathrm{cost}(\pi) = \sum_{t=0}^{n-2} C_{\pi_t, \pi_{t+1}}.
+  \label{eq:opentsp}
+\end{equation}
+Unlike the closed TSP, there is no return edge $C_{\pi_{n-1}, \pi_0}$: the vehicle is not required to return to the depot. This matches the last-mile delivery setting in which a driver's shift ends at the final stop rather than back at the depot.
+
+Both algorithms below decompose \eqref{eq:opentsp} into small sub-tours over $k \ll n$ nodes (a \emph{qubit budget}, since each candidate node in a sub-tour occupies one binary variable per position in the underlying QUBO), solved with the Quantum Approximate Optimization Algorithm (QAOA), and reassembled classically into a full permutation.
+
+\section{Algorithm 1: Warm-Start Receding-Horizon QAOA (WS-LR-QAOA, ``Hybrid 2+5'')}
+\label{sec:hybrid}
+
+This is a pure heuristic construction: starting at the depot, it repeatedly solves a small QAOA sub-tour problem over the $k$ nearest (and optionally, exploratory) unvisited nodes, commits a batch of the first $b \le k$ nodes of the resulting order, and repeats from the new current node until every node has been visited. A closing 2-opt pass polishes the assembled tour.
+
+\subsection{Candidate Selection}
+\label{sec:hybrid-candidates}
+
+Let $u$ be the current node and $U$ the set of unvisited nodes. With qubit budget $k$ and exploration fraction $\rho \in [0,1]$, define
+\begin{align}
+  n_{\mathrm{explore}} &= \left\lfloor \rho \, k \right\rfloor, \qquad n_{\mathrm{near}} = k - n_{\mathrm{explore}}, \\
+  N_{\mathrm{near}}(u) &= \text{the } n_{\mathrm{near}} \text{ closest nodes in } U \text{ to } u \text{ by } C_{u,\cdot}, \\
+  N_{\mathrm{explore}}(u) &\sim \mathrm{Unif}\!\left(\binom{U \setminus N_{\mathrm{near}}(u)}{n_{\mathrm{explore}}}\right),
+\end{align}
+i.e.\ $n_{\mathrm{explore}}$ candidates are drawn uniformly at random, without replacement, from the remaining unvisited nodes not already selected as nearest. The candidate set is $K(u) = N_{\mathrm{near}}(u) \cup N_{\mathrm{explore}}(u)$, $|K(u)| = k$. Exploration prevents the receding-horizon construction from being purely greedy, at the cost of occasionally routing through a farther node.
+
+\subsection{QUBO Formulation of the $k$-Node Sub-Tour}
+\label{sec:hybrid-qubo}
+
+The sub-tour problem assigns each of the $k$ candidates in $K(u) = \{c_1,\dots,c_k\}$ to a position $t \in \{0,\dots,k-1\}$ in an ordering starting from $u$. Binary variable $x_{i,t} = 1$ iff candidate $c_i$ occupies position $t$. This is a one-hot (permutation) encoding with $k^2$ binary variables. The QUBO objective $Q \in \Real^{k^2 \times k^2}$ is built from three components.
+
+\paragraph{Cost terms.} The first-step edge cost (from $u$) and inter-candidate edge costs:
+\begin{align}
+  Q_{(i,0),(i,0)} &\mathrel{+}= C_{u, c_i}, & \forall i, \\
+  Q_{(i,t),(j,t+1)} &\mathrel{+}= C_{c_i, c_j}, & \forall i \ne j,\ t = 0,\dots,k-2.
+\end{align}
+
+\paragraph{Row constraint} (each candidate assigned exactly one position), penalty weight $P$:
+\begin{equation}
+  P\Big(\sum_{t} x_{i,t} - 1\Big)^2 = P\Big({-}\sum_t x_{i,t} + \sum_{t_1 \ne t_2} x_{i,t_1}x_{i,t_2}\Big) + \text{const},
+\end{equation}
+contributing $Q_{(i,t),(i,t)} \mathrel{+}= -P$ and $Q_{(i,t_1),(i,t_2)} \mathrel{+}= P$ for every $t_1 \ne t_2$.
+
+\paragraph{Column constraint} (each position filled by exactly one candidate), the symmetric counterpart over $i$ instead of $t$, also weight $P$.
+
+Combined, the diagonal (linear) coefficient for $x_{i,t}$ is $C_{u,c_i}\,[t{=}0] - 2P$ and the row/column penalties contribute $+P$ off-diagonally within each row and each column block. (An implementation detail worth flagging explicitly: the row/column penalty accumulation loops must exclude the self-term $t_1 = t_2$ when adding the $+P$ off-diagonal contribution, or the $-P$ diagonal bias cancels back to zero and the one-hot constraint stops penalizing an unassigned variable — this was a real bug caught and fixed during development of the codebase this document describes.)
+
+\subsection{LP Relaxation Warm Start}
+\label{sec:hybrid-warmstart}
+
+Following Egger, Mareček, and Woerner \cite{egger2021warmstarting}, the binary QUBO is relaxed to a continuous LP over $x \in [0,1]^{k^2}$ with the same cost vector (the linear part of $Q$) and equality constraints $\sum_t x_{i,t} = 1\ \forall i$, $\sum_i x_{i,t} = 1\ \forall t$, solved to obtain $x^{\mathrm{LP}} \in [0,1]^{k^2}$, clipped to $[\varepsilon, 1-\varepsilon]$ for numerical stability. Each qubit is initialized with a $Y$-rotation
+\begin{equation}
+  \theta_{i,t} = 2\arcsin\!\left(\sqrt{x^{\mathrm{LP}}_{i,t}}\right), \qquad \ket{\phi^*} = \bigotimes_{i,t} R_Y(\theta_{i,t})\ket{0},
+  \label{eq:wsangle}
+\end{equation}
+biasing the initial quantum state toward the LP solution rather than the uniform superposition $\ket{+}^{\otimes k^2}$.
+
+\subsection{QAOA Circuit}
+\label{sec:hybrid-circuit}
+
+For $p$ layers with parameters $(\gamma_1,\beta_1,\dots,\gamma_p,\beta_p)$, the circuit alternates a cost unitary and a mixer unitary on top of the warm-started initial state \eqref{eq:wsangle}:
+\begin{equation}
+  \ket{\psi(\vec\gamma,\vec\beta)} = \prod_{l=1}^{p} U_M(\beta_l)\,U_C(\gamma_l)\; \ket{\phi^*}.
+\end{equation}
+
+\paragraph{Cost unitary.} Diagonal in the computational basis, built directly from $Q$:
+\begin{equation}
+  U_C(\gamma) = \exp\!\Big({-}i\gamma \sum_{a} Q_{aa}\, Z_a\Big)\ \exp\!\Big({-}i\gamma \sum_{a<b} (Q_{ab}{+}Q_{ba})\, Z_a Z_b\Big),
+\end{equation}
+implemented as single-qubit $R_Z$ rotations and two-qubit $R_{ZZ}$ rotations, one per nonzero off-diagonal pair.
+
+\paragraph{Mixer.} Two variants are supported:
+\begin{align}
+  \text{WS mixer (default):}\quad & U_M^{\mathrm{ws}}(\beta) = \bigotimes_{a} R_Y(\theta_a)\,R_X(2\beta)\,R_Y(-\theta_a), \\
+  \text{XY mixer (optional):}\quad & U_M^{\mathrm{xy}}(\beta) = \prod_{(a,b) \in E_{\mathrm{ring}}} \exp\!\big({-}i\beta\,(X_aX_b + Y_aY_b)\big),
+\end{align}
+where $E_{\mathrm{ring}}$ connects adjacent position-qubits within the same candidate's row block (a partial Hamming-weight-preserving mixer). The WS mixer rotates around the warm-start-biased axis rather than the computational basis, per \cite{egger2021warmstarting}.
+
+\subsection{Parameter Optimization and Decoding}
+\label{sec:hybrid-decode}
+
+Parameters $(\vec\gamma,\vec\beta)$ are optimized classically via COBYLA to minimize the expected energy $\sum_x |\langle x|\psi\rangle|^2 \, x^\top Q x$ (summed over basis states with non-negligible amplitude). After optimization, the sub-tour is decoded position-by-position: for $t = 0,\dots,k-1$, the not-yet-used candidate $i$ maximizing $|\langle x | \psi \rangle|^2$ restricted to $x_{i,t}=1$ is assigned to position $t$ (ties/infeasibilities broken by lowest remaining index).
+
+\subsection{Batch Commitment and Receding Horizon}
+\label{sec:hybrid-batch}
+
+Only the first $b \le k$ nodes of the decoded order (the \emph{batch}) are appended to the tour; the current node advances to the $b$-th, the committed nodes are removed from $U$, and Section~\ref{sec:hybrid-candidates}--\ref{sec:hybrid-decode} repeat. Small $b$ relative to $k$ lets QAOA see further ahead than it commits to, at the cost of more sub-problems solved per full tour ($\approx (n{-}1)/b$).
+
+\subsection{Closing 2-opt}
+\label{sec:hybrid-2opt}
+
+Once every node is committed, a standard open-path 2-opt local search repeatedly reverses sub-segments $[i,j]$ of the assembled tour whenever doing so strictly reduces $C_{\pi_{i-1},\pi_i} + C_{\pi_j,\pi_{j+1}} \to C_{\pi_{i-1},\pi_j} + C_{\pi_i,\pi_{j+1}}$ (with the obvious boundary case at $j = n{-}1$, since there is no return edge), until no improving move remains or an iteration cap is hit.
+
+\begin{algorithm}
+\caption{WS-LR-QAOA with Receding Horizon (Hybrid 2+5)}
+\begin{algorithmic}[1]
+\State $\pi \gets [d]$; $u \gets d$; $U \gets \{0,\dots,n-1\}\setminus\{d\}$
+\While{$U \ne \emptyset$}
+  \State $K(u) \gets$ candidates via Sec.~\ref{sec:hybrid-candidates}, $k_{\mathrm{batch}} = \min(k, |U|)$
+  \State $Q \gets$ QUBO via Sec.~\ref{sec:hybrid-qubo}; $x^{\mathrm{LP}} \gets$ LP relaxation via Sec.~\ref{sec:hybrid-warmstart}
+  \State order $\gets$ QAOA-solve-and-decode$(Q, x^{\mathrm{LP}})$ via Sec.~\ref{sec:hybrid-circuit}--\ref{sec:hybrid-decode}
+  \State commit $\gets$ order$[0{:}b]$; append commit to $\pi$; $U \gets U \setminus$ commit; $u \gets$ commit$[-1]$
+\EndWhile
+\State $\pi \gets$ 2-opt$(\pi)$ via Sec.~\ref{sec:hybrid-2opt}
+\State \Return $\pi$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Algorithm 2: Column Generation with QAOA Pricing (CG-Hybrid-LRWSQAOA-Sub)}
+\label{sec:cg}
+
+This algorithm recasts \eqref{eq:opentsp} as a set-partitioning problem over path \emph{segments} (columns), solved by column generation, in which the pricing subproblem that proposes new columns is Algorithm~1's QAOA sub-tour solver, reused without modification. The master problem decides \emph{which} of many QAOA-proposed segments to keep; QAOA never decides node membership across segments, only ordering within one.
+
+\subsection{Master Problem}
+\label{sec:cg-master}
+
+A column $p$ is an ordered node sequence $p = (p_1,\dots,p_{|p|})$ with cost $c_p = \sum_{i=1}^{|p|-1} C_{p_i,p_{i+1}}$ (an open sub-path cost). Let $\mathcal{P}$ be the current column pool. The master problem selects columns whose node sets partition $\{0,\dots,n-1\}$ exactly:
+\begin{align}
+  \min_{x} \quad & \sum_{p \in \mathcal{P}} c_p\, x_p \label{eq:master-obj}\\
+  \text{s.t.} \quad & \sum_{p \,:\, i \in p} x_p = 1 \qquad \forall i \in \{0,\dots,n-1\}, \label{eq:master-cover}\\
+  & x_p \in [0,1] \ \text{(pricing rounds)} \quad \text{or} \quad x_p \in \{0,1\} \ \text{(final round)}. \label{eq:master-domain}
+\end{align}
+The LP relaxation \eqref{eq:master-obj}--\eqref{eq:master-domain} yields dual prices $\pi_i$ for each constraint \eqref{eq:master-cover}, one per node. Solved with PuLP/CBC.
+
+\subsection{Initial Columns}
+\label{sec:cg-init}
+
+To seed a feasible, non-degenerate first LP, one singleton column $\{i\}$ is created per node, with cost
+\begin{equation}
+  c_{\{i\}} = \begin{cases} C_{d,i}, & i \ne d \\ 0, & i = d.\end{cases}
+  \label{eq:init-cost}
+\end{equation}
+Seeding with $C_{d,i}$ rather than $0$ matters: since the initial pool's coverage matrix is the identity (exactly one column touches each node), the LP is forced into a degenerate basic solution regardless of cost, and if that basis has cost $0$ the resulting duals are \emph{identically zero} for every node ($\pi = c_B^\top A_B^{-1} = 0$ when $c_B = 0$). Zero duals make every subsequently priced multi-node column look non-improving. Seeding with distance-from-depot yields $\pi_i = C_{d,i}$ at iteration 1 — a standard ``naive star-tour'' baseline price — giving the pricing step a real signal from the first iteration.
+
+\subsection{Pricing Subproblem}
+\label{sec:cg-pricing}
+
+For iteration $\tau = 1,\dots,\mathrm{ITERATION\_CG}$, with current duals $\pi^{(\tau)}$ (from the LP solved on the pool accumulated so far), every node $u \in \{0,\dots,n-1\}$ is used as a pricing start (depot excluded from every other node's candidate pool, so only $u=d$'s own column can ever contain the depot):
+
+\paragraph{Candidate selection.} At $\tau = 1$, plain nearest-by-distance, as in Sec.~\ref{sec:hybrid-candidates} with $\pi^{(1)}$ unused. At $\tau \ge 2$, candidates are ranked, not filtered, by \emph{reduced cost}:
+\begin{equation}
+  r(u,x) = C_{u,x} - \pi^{(\tau)}_x, \qquad
+  N_{\mathrm{near}}(u) = \text{the } n_{\mathrm{near}} \text{ nodes minimizing } r(u,\cdot),
+  \label{eq:reduced-cost-rank}
+\end{equation}
+optionally restricted beforehand to $\{x : C_{u,x} \le R \cdot D_{\max}\}$ where $D_{\max} = \max_{i,j} C_{ij}$ and $R = \mathrm{RADIUS\_POOL\_SEARCH}$ (default $1.0$, a no-op since no distance can exceed $D_{\max}$). Selection is a ranking, not a sign threshold: a candidate need not have $r(u,x) < 0$, only be among the $n_{\mathrm{near}}$ smallest. This guarantees a full-size candidate set whenever the pool has enough points, and independently re-derives its own candidates for every $u$ — no state is shared or depleted across different starting points within an iteration.
+
+\paragraph{Dual-adjusted QAOA matrix.} At $\tau \ge 2$, QAOA itself solves over a modified cost matrix rather than raw distances:
+\begin{equation}
+  \tilde{C}_{i,j} = C_{i,j} - \pi^{(\tau)}_j \qquad \forall i,j,
+  \label{eq:dual-matrix}
+\end{equation}
+i.e.\ every arrival at node $j$ is credited by its current dual price. Passed to Sec.~\ref{sec:hybrid-qubo}--\ref{sec:hybrid-decode} unmodified (Algorithm~1's QAOA solver is reused as-is), so QAOA searches for orderings of \emph{low reduced cost}, not merely short ones. All downstream cost bookkeeping (below) reverts to the raw $C$; $\tilde C$ is used only inside the QAOA solve.
+
+\subsection{Truncation into Multiple Columns}
+\label{sec:cg-truncate}
+
+QAOA returns one ordering $\mathrm{full} = (u, s_1,\dots,s_k)$ per pricing start $u$. Rather than adding only this one column, \emph{every prefix} is priced and (conditionally) added:
+\begin{equation}
+  \text{for } L = k{+}1, k, \dots, 1: \quad
+  \mathrm{seg}_L = \mathrm{full}[1{:}L], \quad
+  \hat r(\mathrm{seg}_L) = c_{\mathrm{seg}_L} - \sum_{i \in \mathrm{seg}_L} \pi^{(\tau)}_i,
+  \label{eq:truncation}
+\end{equation}
+keeping $\mathrm{seg}_L$ in the pool iff $\hat r(\mathrm{seg}_L) < -\epsilon$ (or unconditionally for $L=1$, the trivial singleton, as a feasibility floor). A single QAOA call thus yields up to $k{+}1$ column candidates at negligible extra classical cost, since the ordering was already computed.
+
+\subsection{Iterative Procedure}
+\label{sec:cg-iterate}
+
+\begin{algorithm}[H]
+\caption{Column Generation with QAOA Pricing}
+\begin{algorithmic}[1]
+\State $\mathcal{P} \gets$ initial singleton columns via Sec.~\ref{sec:cg-init}
+\For{$\tau = 1$ \textbf{to} $\mathrm{ITERATION\_CG}$}
+  \State $\pi^{(\tau)} \gets$ dual prices from LP relaxation of \eqref{eq:master-obj}--\eqref{eq:master-domain} over $\mathcal{P}$
+  \State $\mathcal{P}_{\mathrm{new}} \gets \emptyset$
+  \For{\textbf{every} $u \in \{0,\dots,n-1\}$} \Comment{every node, every iteration}
+    \State candidates $\gets$ Sec.~\ref{sec:cg-pricing}; $\tilde C \gets$ Eq.~\eqref{eq:dual-matrix} if $\tau \ge 2$ else $C$
+    \State full $\gets$ QAOA-solve-and-decode$(u,$ candidates$, \tilde C)$
+    \State $\mathcal{P}_{\mathrm{new}} \gets \mathcal{P}_{\mathrm{new}} \cup \{$truncations passing Eq.~\eqref{eq:truncation}$\}$
+  \EndFor
+  \State $\mathcal{P} \gets \mathcal{P} \cup \mathcal{P}_{\mathrm{new}}$ (deduplicated by node sequence)
+  \If{$\mathcal{P}_{\mathrm{new}}$ contributed no genuinely new column} \textbf{break} \Comment{converged}
+  \EndIf
+\EndFor
+\State $x^\star \gets$ solve \eqref{eq:master-obj}--\eqref{eq:master-domain} over $\mathcal{P}$ with $x_p \in \{0,1\}$ (fallback: greedy set cover if infeasible/non-optimal)
+\State selected $\gets \{p : x_p^\star = 1\}$
+\State $\pi \gets$ concatenate selected (depot segment first; remaining chained greedily by nearest segment-start to current tour end)
+\State $\pi \gets$ 2-opt$(\pi)$ via Sec.~\ref{sec:hybrid-2opt}
+\State \Return $\pi$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Segment Concatenation}
+\label{sec:cg-concat}
+
+The final integer solution is a set of node-disjoint segments partitioning all $n$ nodes, exactly one of which starts at the depot (by the pricing exclusion rule in Sec.~\ref{sec:cg-pricing}). Segments are concatenated greedily: starting from the depot segment, repeatedly append whichever remaining segment's first node is nearest (by $C$) to the current tour's last node, until all segments are placed. The resulting raw tour is polished by the same 2-opt as Algorithm~1 (Sec.~\ref{sec:hybrid-2opt}).
+
+\subsection{A Structural Caveat}
+\label{sec:cg-caveat}
+
+The master objective \eqref{eq:master-obj} sums each column's \emph{internal} edge costs only; it has no visibility into the eventual inter-segment ``stitch'' edges introduced at concatenation time (Sec.~\ref{sec:cg-concat}), since those depend on an ordering decided only after the master has already run. Consequently the master can select a cheap-looking column (e.g.\ a lone singleton) that turns out to be expensive to splice into the final tour, and the final reported tour cost is not literally the master's optimized objective plus a residual — it includes stitching cost the master never saw. This is a genuine, disclosed limitation of the current design, not an oversight: a stronger formulation would need either a master objective that anticipates concatenation cost, or a route-construction step that is co-optimized with column selection rather than sequential.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{egger2021warmstarting}
+D.~J.~Egger, J.~Mareček, S.~Woerner.
+\emph{Warm-starting quantum optimization}.
+Quantum \textbf{5}, 479 (2021).
+
+\bibitem{farhi2014qaoa}
+E.~Farhi, J.~Goldstone, S.~Gutmann.
+\emph{A Quantum Approximate Optimization Algorithm}.
+arXiv:1411.4028 (2014).
+
+\bibitem{hadfield2019qaoansatz}
+S.~Hadfield, Z.~Wang, B.~O'Gorman, E.~G.~Rieffel, D.~Venturelli, R.~Biswas.
+\emph{From the Quantum Approximate Optimization Algorithm to a Quantum Alternating Operator Ansatz}.
+Algorithms \textbf{12}(2), 34 (2019).
+
+\bibitem{wang2020xymixers}
+Z.~Wang, N.~C.~Rubin, J.~M.~Dominy, E.~G.~Rieffel.
+\emph{XY mixers: Analytical and numerical results for the quantum alternating operator ansatz}.
+Physical Review A \textbf{101}, 012320 (2020).
+
+\bibitem{huang2025cvrpqaoacg}
+W.-H.~Huang, H.~Matsuyama, Y.~Yamashiro.
+\emph{Solving Capacitated Vehicle Routing Problem with Quantum Alternating Operator Ansatz and Column Generation}.
+arXiv:2503.17051 (2025); accepted, IEEE QCNC 2026.
+
+\end{thebibliography}
+
+\end{document}

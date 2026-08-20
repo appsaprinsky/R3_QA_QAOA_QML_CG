@@ -47,6 +47,7 @@ there is one single source of truth for the default iteration count.
 Saves frames into 'cg_visualizations/' without GUI blocking.
 """
 
+import math
 import os
 import time
 import warnings
@@ -111,142 +112,155 @@ def _frame_duals_snapshot(depot_idx, duals, n, iteration, pool_size, output_dir,
 # Pricing subproblem detail for a sampled node within a sampled iteration
 # =====================================================================
 
+MAX_CANDIDATE_ROWS_PER_COLUMN = 22  # bounds table height regardless of how many candidates exist
+
+
+def _draw_minitable(ax, rows_chunk, col_labels, cell_formatter, title=None, col_widths=None):
+    """Draws one bounded-height table (<= MAX_CANDIDATE_ROWS_PER_COLUMN rows)
+    into `ax`. Used to render the candidate table as several side-by-side
+    column-groups instead of one arbitrarily long list -- see
+    _frame_pricing_node for why."""
+    ax.axis("off")
+    ax.set_xlim(0, 1)
+    if not rows_chunk:
+        return
+    cell_text, cell_colors = [], []
+    for row in rows_chunk:
+        text, color = cell_formatter(row)
+        cell_text.append(text)
+        cell_colors.append([color] * len(col_labels))
+
+    table = ax.table(cellText=cell_text, colLabels=col_labels, cellColours=cell_colors,
+                      cellLoc="center", loc="upper center", colWidths=col_widths)
+    table.auto_set_font_size(False)
+    table.set_fontsize(7.6)
+    table.scale(1, 1.7)
+    for (r, c), cell in table.get_celld().items():
+        if r == 0:
+            cell.set_facecolor("#2B2B2B")
+            cell.set_text_props(color="white", weight="bold")
+        elif c == 0:
+            cell.set_text_props(ha="left")
+        cell.set_edgecolor("#cccccc")
+    if title:
+        ax.set_title(title, fontsize=9, pad=8)
+
+
 def _frame_pricing_node(
     frame_idx, coords, matrix, curr_node, nearest, explore, full_nodes,
     truncation_records, candidate_rows, iteration, output_dir, formats,
 ):
-    # Figure height grows with row count so a full candidate list (every
-    # other node, not a capped sample) stays readable instead of being
-    # squeezed into a fixed-size table.
-    n_rows = max(len(candidate_rows), len(truncation_records), 1)
-    fig_height = max(6.6, 1.8 + 0.30 * n_rows)
+    """
+    Three logical panels: map, candidate-selection economics, prefix
+    truncations. The candidate panel shows EVERY other node (per the
+    "go through all points" requirement) -- but on a real ~100-250 stop
+    route that is a lot of rows, and a single vertical table that tall
+    was making the WHOLE FIGURE grow to 40-60+ inches tall (figure
+    height was scaled linearly with row count), which meant the map
+    panel got squeezed to an invisible sliver whenever the image was
+    viewed at any normal scale. Fixed here by wrapping the candidate
+    list into several side-by-side column-groups of at most
+    MAX_CANDIDATE_ROWS_PER_COLUMN rows each, so figure height stays
+    bounded regardless of node count -- the map is always a normal,
+    visible size. Width grows with candidate count instead (more
+    columns), which scales far more usably in an image viewer than
+    height did.
+    """
+    n_cand_cols = max(1, math.ceil(len(candidate_rows) / MAX_CANDIDATE_ROWS_PER_COLUMN)) if candidate_rows else 1
+    rows_per_col = MAX_CANDIDATE_ROWS_PER_COLUMN
 
-    fig, axes = plt.subplots(1, 3, figsize=(19.5, fig_height),
-                              gridspec_kw={"width_ratios": [1.0, 1.0, 0.95]})
+    # Figure height bounded by the larger of (one candidate column's row
+    # count, truncation row count) -- NOT the total candidate count.
+    max_rows_for_height = max(min(len(candidate_rows), rows_per_col) if candidate_rows else 1,
+                               len(truncation_records), 1)
+    fig_height = max(6.6, 1.8 + 0.30 * max_rows_for_height)
+    fig_width = 7.6 + 3.1 * n_cand_cols + 6.4
 
-    ax = axes[0]
-    ax.scatter(coords[:, 0], coords[:, 1], c="#d9d9d9", s=35, zorder=1)
+    width_ratios = [1.35] + [1.0] * n_cand_cols + [1.15]
+    fig, axes = plt.subplots(1, 2 + n_cand_cols, figsize=(fig_width, fig_height),
+                              gridspec_kw={"width_ratios": width_ratios})
+    ax_map = axes[0]
+    ax_cands = axes[1:1 + n_cand_cols]
+    ax_trunc = axes[-1]
+
+    # --- Map panel ---
+    ax_map.scatter(coords[:, 0], coords[:, 1], c="#d9d9d9", s=35, zorder=1)
     if nearest:
         nc = coords[nearest]
-        ax.scatter(nc[:, 0], nc[:, 1], c="#3b6fa0", s=130, marker="o", zorder=3,
-                   edgecolors="white", linewidths=0.8, label="Nearest candidate")
+        ax_map.scatter(nc[:, 0], nc[:, 1], c="#3b6fa0", s=130, marker="o", zorder=3,
+                        edgecolors="white", linewidths=0.8, label="Nearest candidate")
     if explore:
         ec = coords[explore]
-        ax.scatter(ec[:, 0], ec[:, 1], c="#e07b1a", s=130, marker="^", zorder=3,
-                   edgecolors="white", linewidths=0.8, label="Exploration candidate")
+        ax_map.scatter(ec[:, 0], ec[:, 1], c="#e07b1a", s=130, marker="^", zorder=3,
+                        edgecolors="white", linewidths=0.8, label="Exploration candidate")
 
     full_path_coords = coords[full_nodes]
-    _plot_directional_route(ax, full_path_coords, "#5b2d8e", linewidth=1.6, zorder=4)
-    ax.scatter(*coords[curr_node], c="#1a1a1a", s=210, marker="*", zorder=6,
-               edgecolors="white", linewidths=1.0, label=f"Start node {curr_node}")
+    _plot_directional_route(ax_map, full_path_coords, "#5b2d8e", linewidth=1.6, zorder=4)
+    ax_map.scatter(*coords[curr_node], c="#1a1a1a", s=210, marker="*", zorder=6,
+                    edgecolors="white", linewidths=1.0, label=f"Start node {curr_node}")
 
-    for idx in [curr_node] + nearest + explore:
-        ax.annotate(str(idx), (coords[idx, 0], coords[idx, 1]), fontsize=7.5,
-                    color=COLOR_TEXT, xytext=(3, 3), textcoords="offset points", zorder=7)
+    label_nodes = [curr_node] + nearest + explore
+    if len(label_nodes) > 40:  # keep the map legible on a real route with many candidates
+        label_nodes = label_nodes[:40]
+    for idx in label_nodes:
+        ax_map.annotate(str(idx), (coords[idx, 0], coords[idx, 1]), fontsize=7.5,
+                         color=COLOR_TEXT, xytext=(3, 3), textcoords="offset points", zorder=7)
 
-    ax.set_title(f"QAOA sub-tour from node {curr_node}  (iteration {iteration}"
-                 f"{', dual-filtered' if iteration >= 2 else ''})", fontsize=10.5)
-    ax.legend(loc="best", fontsize=8)
-    _style_axes(ax)
+    ax_map.set_title(f"QAOA sub-tour from node {curr_node}  (iteration {iteration}"
+                      f"{', dual-filtered' if iteration >= 2 else ''})", fontsize=10.5)
+    ax_map.legend(loc="best", fontsize=8)
+    _style_axes(ax_map)
 
-    # --- Middle panel: candidate-selection economics ---
-    # This is the step that was invisible before: for iteration >= 2,
-    # "nearest" candidates are NOT simply the closest-by-distance nodes --
-    # they are the closest nodes AMONG those with distance(curr, x) -
-    # dual(x) < 0 (i.e. individually negative reduced cost). This table
-    # shows that computation directly, per candidate node, instead of
-    # only showing which nodes ended up selected.
-    ax1 = axes[1]
-    ax1.axis("off")
-    cand_labels = ["Node", "Dist", "Dual", "Dist \u2212 Dual", "Selected as"]
-    cand_text = []
-    cand_colors = []
-    for row in candidate_rows:
+    # --- Candidate-selection economics, split into bounded-height column-groups ---
+    cand_labels = ["Node", "Dist", "Dual", "D\u2212Dual", "Sel."]
+
+    def _cand_formatter(row):
         node, dist, dual, net, role = row
-        cand_text.append([
-            str(node),
-            f"{dist:.1f}",
-            f"{dual:.1f}",
-            f"{net:+.1f}",
-            role,
-        ])
+        text = [str(node), f"{dist:.1f}", f"{dual:.1f}", f"{net:+.1f}", role]
         if role == "nearest":
-            row_color = "#dbe8f5"
+            color = "#dbe8f5"
         elif role == "explore":
-            row_color = "#fbe6d2"
+            color = "#fbe6d2"
         else:
-            row_color = "#f2f2f2"
-        cand_colors.append([row_color] * len(cand_labels))
+            color = "#f2f2f2"
+        return text, color
 
-    cand_table = ax1.table(cellText=cand_text, colLabels=cand_labels, cellColours=cand_colors,
-                            cellLoc="center", loc="center",
-                            colWidths=[0.16, 0.16, 0.16, 0.28, 0.24])
-    cand_table.auto_set_font_size(False)
-    cand_table.set_fontsize(9)
-    cand_table.scale(1, 1.85)
-    for (row, col), cell in cand_table.get_celld().items():
-        if row == 0:
-            cell.set_facecolor("#2B2B2B")
-            cell.set_text_props(color="white", weight="bold")
-        cell.set_edgecolor("#cccccc")
+    chunks = [candidate_rows[i:i + rows_per_col] for i in range(0, len(candidate_rows), rows_per_col)] \
+        if candidate_rows else [[]]
+    for i, ax_c in enumerate(ax_cands):
+        chunk_title = None
+        if i == 0:
+            chunk_title = (f"Candidate selection at node {curr_node}\n"
+                            + ("\"Nearest\" = smallest (dist \u2212 dual), ranked -- not a sign filter"
+                               if iteration >= 2 else
+                               "Iteration 1: plain closest-by-distance (duals not yet used)"))
+        _draw_minitable(ax_c, chunks[i] if i < len(chunks) else [], cand_labels, _cand_formatter, chunk_title,
+                         col_widths=[0.18, 0.20, 0.20, 0.22, 0.20])
 
-    if iteration >= 2:
-        subtitle = "\"Nearest\" = smallest (dist \u2212 dual), ranked -- not a sign filter"
-    else:
-        subtitle = "Iteration 1: plain closest-by-distance (duals not yet used)"
-    ax1.set_title(f"Candidate selection at node {curr_node}\n{subtitle}", fontsize=10, pad=14)
-    ax1.set_xlim(0, 1)
+    if not candidate_rows:
+        ax_cands[0].text(0.5, 0.5, "No other nodes available", transform=ax_cands[0].transAxes,
+                          ha="center", va="center", fontsize=9, color="#888888", style="italic")
 
-    # --- Right panel: prefix truncations (column pricing outcome) ---
-    ax2 = axes[2]
-    ax2.axis("off")
-    col_labels = ["Column", "Cost", "\u03a3 duals", "Red. cost", "Kept?"]
-    cell_text = []
-    cell_colors = []
-    if truncation_records:
-        for rec in truncation_records:
-            path_str = "\u2192".join(str(x) for x in rec["nodes"])
-            cell_text.append([
-                path_str,
-                f"{rec['cost']:.1f}",
-                f"{rec['dual_sum']:.1f}",
-                f"{rec['reduced_cost']:+.1f}",
-                "kept" if rec["kept"] else "dropped",
-            ])
-            row_color = "#e6f4e6" if rec["kept"] else "#f2f2f2"
-            cell_colors.append([row_color] * len(col_labels))
-    else:
-        # No candidates -> QAOA never ran for this node this iteration.
-        # Still show the trivial singleton column rather than an empty
-        # table, so the "why nothing happened here" case is explicit.
-        cell_text.append([str(curr_node), "0.0", "0.0", "+0.0", "kept (singleton)"])
-        cell_colors.append(["#e6f4e6"] * len(col_labels))
+    # --- Prefix truncations (column pricing outcome) ---
+    trunc_labels = ["Column", "Cost", "\u03a3\u03c0", "R.cost", "Kept?"]
 
-    table = ax2.table(cellText=cell_text, colLabels=col_labels, cellColours=cell_colors,
-                       cellLoc="center", loc="center",
-                       colWidths=[0.34, 0.14, 0.16, 0.20, 0.16])
-    table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    table.scale(1, 1.85)
-    for (row, col), cell in table.get_celld().items():
-        if row == 0:
-            cell.set_facecolor("#2B2B2B")
-            cell.set_text_props(color="white", weight="bold")
-        elif col == 0:
-            cell.set_text_props(ha="left")
-            cell.PAD = 0.02
-        cell.set_edgecolor("#cccccc")
+    def _trunc_formatter(rec):
+        path_str = "\u2192".join(str(x) for x in rec["nodes"])
+        text = [path_str, f"{rec['cost']:.1f}", f"{rec['dual_sum']:.1f}",
+                f"{rec['reduced_cost']:+.1f}", "kept" if rec["kept"] else "dropped"]
+        color = "#e6f4e6" if rec["kept"] else "#f2f2f2"
+        return text, color
 
+    _draw_minitable(ax_trunc, truncation_records, trunc_labels, _trunc_formatter,
+                     title=f"Prefix truncations (full path)\niteration {iteration} duals",
+                     col_widths=[0.44, 0.14, 0.14, 0.16, 0.12])
     if not truncation_records:
-        ax2.text(0.5, 0.15, "No candidates qualified this iteration\n(every dist \u2212 dual \u2265 0)",
-                  transform=ax2.transAxes, ha="center", va="top", fontsize=9,
-                  color="#a03030", style="italic")
+        ax_trunc.text(0.5, 0.4, "No candidates qualified this iteration\n(every dist \u2212 dual \u2265 0)",
+                       transform=ax_trunc.transAxes, ha="center", va="top", fontsize=9,
+                       color="#a03030", style="italic")
 
-    ax2.set_title(f"Prefix truncations (full path), iteration {iteration} duals", fontsize=10, pad=14)
-    ax2.set_xlim(0, 1)
-
-    fig.suptitle(f"Step 2 \u2014 Pricing Subproblem: node {curr_node}, iteration {iteration}", fontsize=13, y=0.98)
-    fig.subplots_adjust(top=0.84, wspace=0.3)
+    fig.suptitle(f"Step 2 \u2014 Pricing Subproblem: node {curr_node}, iteration {iteration}", fontsize=13, y=0.99)
+    fig.subplots_adjust(top=0.86, wspace=0.35)
     _save_all_formats(
         fig, os.path.join(output_dir, f"02_{frame_idx:03d}_iter{iteration}_node{curr_node}"), formats
     )

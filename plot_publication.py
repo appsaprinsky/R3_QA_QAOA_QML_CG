@@ -35,29 +35,35 @@ import os
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 from matplotlib.lines import Line2D
+from matplotlib.patches import FancyBboxPatch
 
 # ---------------------------------------------------------------------
 # Shared visual language
 # ---------------------------------------------------------------------
 
 COLOR_DEPOT = "#C1272D"       # red diamond
-COLOR_GRID = "#D8D8D8"
-COLOR_TEXT = "#2B2B2B"
+COLOR_GRID = "#E4E6EA"
+COLOR_TEXT = "#26282B"
+COLOR_BG = "#F7F8FA"          # soft off-white figure background
+COLOR_PANEL_BG = "#FFFFFF"    # pure white plot area, contrasts against COLOR_BG
+COLOR_WIN = "#1a7a3c"         # scorecard "faster" green
+COLOR_LOSE = "#b0392f"        # scorecard "slower" red
 CMAP_AMAZON = "Blues"
 CMAP_HYBRID = "Greens"
 
 plt.rcParams.update({
     "font.family": "DejaVu Sans",
-    "font.size": 10,
-    "axes.titlesize": 12,
+    "font.size": 11,
+    "axes.titlesize": 14,
     "axes.titleweight": "bold",
-    "axes.labelsize": 10,
-    "figure.titlesize": 14,
+    "axes.labelsize": 11,
+    "figure.titlesize": 17,
     "figure.titleweight": "bold",
-    "legend.fontsize": 8.5,
+    "legend.fontsize": 9.5,
     "legend.frameon": True,
-    "legend.framealpha": 0.92,
+    "legend.framealpha": 0.94,
     "legend.edgecolor": "#CCCCCC",
     "savefig.dpi": 300,
     "savefig.bbox": "tight",
@@ -65,30 +71,21 @@ plt.rcParams.update({
 
 
 def _style_axes(ax):
-    ax.set_facecolor("white")
+    ax.set_facecolor(COLOR_PANEL_BG)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_color("#888888")
-    ax.spines["bottom"].set_color("#888888")
-    ax.tick_params(colors="#555555", labelsize=8)
+    ax.spines["left"].set_color("#9A9EA6")
+    ax.spines["bottom"].set_color("#9A9EA6")
+    ax.tick_params(colors="#5A5E66", labelsize=9)
     ax.grid(True, linestyle="--", linewidth=0.6, color=COLOR_GRID, zorder=0)
     ax.set_aspect("equal", adjustable="datalim")
 
 
-def _plot_directional_route(ax, path_coords, color, linewidth=1.5, zorder=3, n_arrows=6):
+def _plot_directional_route(ax, path_coords, color, linewidth=2.0, zorder=3, n_arrows=6):
     """
     Draws `path_coords` (an (N,2) array in visit order) as a single flat,
     fully-opaque, solid-color line -- no color/opacity gradient. Direction
     of travel is shown ONLY via a handful of arrowheads along the path.
-
-    FIX (round 2): a previous version faded brightness from t=0.15 to
-    0.95 along a colormap, which made the start of routes look faint or
-    invisible. A narrower fade (0.55-1.0) was tried next, but any
-    gradient at all still reads as "parts of the line have different
-    opacity" on real, denser routes -- which is exactly what was flagged
-    as still wrong. There is now no gradient of any kind: one solid
-    color, drawn with a thin (not thick) linewidth per request, and
-    arrowheads for direction instead of a brightness cue.
     """
     if len(path_coords) < 2:
         return None
@@ -108,7 +105,7 @@ def _plot_directional_route(ax, path_coords, color, linewidth=1.5, zorder=3, n_a
 
     xlim, ylim = ax.get_xlim(), ax.get_ylim()
     diag = float(np.hypot(xlim[1] - xlim[0], ylim[1] - ylim[0]))
-    arrow_len = diag * 0.028
+    arrow_len = diag * 0.03
 
     idxs = sorted(set(np.linspace(0, n_seg - 1, min(n_arrows, n_seg)).astype(int).tolist()))
     for i in idxs:
@@ -123,20 +120,21 @@ def _plot_directional_route(ax, path_coords, color, linewidth=1.5, zorder=3, n_a
         head = mid + unit * arrow_len / 2.0
         ax.annotate(
             "", xy=tuple(head), xytext=tuple(tail),
-            arrowprops=dict(arrowstyle="-|>", color=color, lw=1.6, mutation_scale=13),
+            arrowprops=dict(arrowstyle="-|>", color=color, lw=1.9, mutation_scale=15),
             zorder=zorder + 1,
         )
     return None
 
 
 def _mark_start_end(ax, path_coords, color, zorder=6):
+    shadow = [pe.SimplePatchShadow(offset=(1.2, -1.2), alpha=0.25), pe.Normal()]
     if len(path_coords) < 1:
         return
-    ax.scatter(*path_coords[0], marker="^", s=190, c=color, edgecolors="white",
-               linewidths=1.2, zorder=zorder, label="_nolegend_")
+    ax.scatter(*path_coords[0], marker="^", s=260, c=color, edgecolors="white",
+               linewidths=1.4, zorder=zorder, label="_nolegend_", path_effects=shadow)
     if len(path_coords) > 1:
-        ax.scatter(*path_coords[-1], marker="s", s=155, c=color, edgecolors="white",
-                   linewidths=1.2, zorder=zorder, label="_nolegend_")
+        ax.scatter(*path_coords[-1], marker="s", s=210, c=color, edgecolors="white",
+                   linewidths=1.4, zorder=zorder, label="_nolegend_", path_effects=shadow)
 
 
 def _annotate_sparse(ax, coords, indices, max_labels=30, fontsize=8, always_include=()):
@@ -176,30 +174,73 @@ def _route_panel(ax, coords, path_indices, cmap_name, route_color, title, cost,
     _mark_start_end(ax, path_coords, route_color)
 
     if depot_idx is not None and depot_idx in path_indices:
+        shadow = [pe.SimplePatchShadow(offset=(1.3, -1.3), alpha=0.3), pe.Normal()]
         ax.scatter(coords[depot_idx, 0], coords[depot_idx, 1], c=COLOR_DEPOT,
-                   s=230, marker="D", edgecolors="white", linewidths=1.3,
-                   zorder=8, label="Depot")
+                   s=290, marker="D", edgecolors="white", linewidths=1.5,
+                   zorder=8, label="Depot", path_effects=shadow)
 
     always = {path_indices[0], path_indices[-1]}
     if depot_idx is not None:
         always.add(depot_idx)
     _annotate_sparse(ax, coords, path_indices, max_labels=max_labels, always_include=always)
 
-    ax.set_title(f"{title}\nCost: {cost:.2f}", fontsize=13)
+    ax.set_title(f"{title}\nCost: {cost:,.1f}  \u2022  {len(path_indices)} stops",
+                 fontsize=14, pad=12, linespacing=1.6)
     _style_axes(ax)
 
     legend_handles = [
         Line2D([0], [0], marker="^", color="none", markerfacecolor=route_color,
-               markeredgecolor="white", markersize=9, label="Start"),
+               markeredgecolor="white", markersize=10, label="Start"),
         Line2D([0], [0], marker="s", color="none", markerfacecolor=route_color,
-               markeredgecolor="white", markersize=8, label="End"),
+               markeredgecolor="white", markersize=9, label="End"),
     ]
     if depot_idx is not None and depot_idx in path_indices:
         legend_handles.append(
             Line2D([0], [0], marker="D", color="none", markerfacecolor=COLOR_DEPOT,
-                   markeredgecolor="white", markersize=9, label="Depot")
+                   markeredgecolor="white", markersize=10, label="Depot")
         )
-    ax.legend(handles=legend_handles, loc="best")
+    leg = ax.legend(handles=legend_handles, loc="best", borderpad=0.8, labelspacing=0.6)
+    leg.get_frame().set_boxstyle("round,pad=0.4,rounding_size=0.5")
+
+
+def _draw_scorecard(fig, route_id, n_stops, amazon_cost, other_cost, algo_label, param_str):
+    """
+    A banner strip between the suptitle and the two route panels: route
+    identity, stop count, both costs side by side, and a color-coded
+    improvement badge -- the "at a glance" summary a reader would
+    otherwise have to reconstruct from the two panel subtitles.
+    """
+    improvement_pct = -100.0 * (other_cost - amazon_cost) / amazon_cost if amazon_cost else 0.0
+    faster = improvement_pct > 0
+    badge_color = COLOR_WIN if faster else COLOR_LOSE
+    badge_text = f"{algo_label} \u25B2 {abs(improvement_pct):.1f}% faster" if faster \
+        else f"Amazon \u25B2 {abs(improvement_pct):.1f}% faster"
+
+    ax = fig.add_axes([0.06, 0.855, 0.88, 0.075])
+    ax.axis("off")
+
+    box = FancyBboxPatch((0, 0), 1, 1, transform=ax.transAxes,
+                          boxstyle="round,pad=0,rounding_size=0.12",
+                          linewidth=1.0, edgecolor="#DDE0E4", facecolor="#FFFFFF", zorder=1)
+    ax.add_patch(box)
+
+    ax.text(0.03, 0.5, f"Route {route_id}", transform=ax.transAxes,
+            ha="left", va="center", fontsize=13, fontweight="bold", color=COLOR_TEXT)
+    ax.text(0.03, 0.08, f"{n_stops} stops  \u2022  {param_str}", transform=ax.transAxes,
+            ha="left", va="bottom", fontsize=9, color="#7A7E86")
+
+    ax.text(0.46, 0.5, f"Amazon: {amazon_cost:,.0f}", transform=ax.transAxes,
+            ha="center", va="center", fontsize=12, color="#1f4e79")
+    ax.text(0.65, 0.5, f"{algo_label}: {other_cost:,.0f}", transform=ax.transAxes,
+            ha="center", va="center", fontsize=12, color="#1a6b1a")
+
+    badge = FancyBboxPatch((0.82, 0.22), 0.15, 0.56, transform=ax.transAxes,
+                            boxstyle="round,pad=0,rounding_size=0.15",
+                            linewidth=0, facecolor=badge_color, alpha=0.14, zorder=2)
+    ax.add_patch(badge)
+    ax.text(0.895, 0.5, badge_text.replace(" \u25B2 ", "\n"), transform=ax.transAxes,
+            ha="center", va="center", fontsize=10.5, fontweight="bold", color=badge_color,
+            linespacing=1.4, zorder=3)
 
 
 def _save_all_formats(fig, path_no_ext, formats=("png", "pdf")):
@@ -246,22 +287,20 @@ def generate_overall_visualizations(
     filename_slug = f"{route_id}_{param_str}"
 
     # ------------------ 1. WITH DEPOT ------------------
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7.8))
+    fig = plt.figure(figsize=(20, 10.5))
+    fig.patch.set_facecolor(COLOR_BG)
+    gs = fig.add_gridspec(1, 2, left=0.05, right=0.97, top=0.77, bottom=0.06, wspace=0.14)
+    axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])]
+
     _route_panel(axes[0], coords, amazon_tour, CMAP_AMAZON, "#1f4e79",
-                 "Amazon Planned (With Depot)", amazon_cost, depot_idx=depot_idx,
+                 "Amazon Planned \u2014 With Depot", amazon_cost, depot_idx=depot_idx,
                  max_labels=max_node_labels)
     _route_panel(axes[1], coords, hybrid_tour, algo_cmap, algo_color,
-                 f"{algo_label} (With Depot)", hybrid_cost, depot_idx=depot_idx,
+                 f"{algo_label} \u2014 With Depot", hybrid_cost, depot_idx=depot_idx,
                  max_labels=max_node_labels)
 
-    improvement_pct = -100.0 * (hybrid_cost - amazon_cost) / amazon_cost if amazon_cost else 0.0
-    fig.suptitle(
-        f"Route {route_id}  \u2022  {n_stops} stops  \u2022  "
-        f"{algo_label + ' faster' if improvement_pct > 0 else 'Amazon faster'} by "
-        f"{abs(improvement_pct):.1f}%\nParameters: {param_str}",
-        fontsize=13, y=0.99,
-    )
-    fig.subplots_adjust(top=0.82)
+    fig.suptitle("Route Comparison", fontsize=19, y=0.965)
+    _draw_scorecard(fig, route_id, n_stops, amazon_cost, hybrid_cost, algo_label, param_str)
     _save_all_formats(fig, os.path.join(depot_dir, filename_slug), formats)
     plt.close(fig)
 
@@ -269,20 +308,20 @@ def generate_overall_visualizations(
     amazon_no_depot = [i for i in amazon_tour if i != depot_idx]
     hybrid_no_depot = [i for i in hybrid_tour if i != depot_idx]
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7.8))
+    fig = plt.figure(figsize=(20, 10.5))
+    fig.patch.set_facecolor(COLOR_BG)
+    gs = fig.add_gridspec(1, 2, left=0.05, right=0.97, top=0.77, bottom=0.06, wspace=0.14)
+    axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])]
+
     _route_panel(axes[0], coords, amazon_no_depot, CMAP_AMAZON, "#1f4e79",
-                 "Amazon Planned (Delivery Stops Only)", amazon_cost, depot_idx=None,
+                 "Amazon Planned \u2014 Delivery Stops Only", amazon_cost, depot_idx=None,
                  max_labels=max_node_labels)
     _route_panel(axes[1], coords, hybrid_no_depot, algo_cmap, algo_color,
-                 f"{algo_label} (Delivery Stops Only)", hybrid_cost, depot_idx=None,
+                 f"{algo_label} \u2014 Delivery Stops Only", hybrid_cost, depot_idx=None,
                  max_labels=max_node_labels)
 
-    fig.suptitle(
-        f"Route {route_id}  \u2022  {n_stops - 1} delivery stops (depot excluded)\n"
-        f"Parameters: {param_str}",
-        fontsize=13, y=0.99,
-    )
-    fig.subplots_adjust(top=0.82)
+    fig.suptitle("Route Comparison (Depot Excluded)", fontsize=19, y=0.965)
+    _draw_scorecard(fig, route_id, n_stops - 1, amazon_cost, hybrid_cost, algo_label, param_str)
     _save_all_formats(fig, os.path.join(no_depot_dir, filename_slug), formats)
     plt.close(fig)
 
