@@ -206,8 +206,8 @@ def _frame_pricing_node(
         ax_map.annotate(str(idx), (coords[idx, 0], coords[idx, 1]), fontsize=7.5,
                          color=COLOR_TEXT, xytext=(3, 3), textcoords="offset points", zorder=7)
 
-    ax_map.set_title(f"QAOA sub-tour from node {curr_node}  (iteration {iteration}"
-                      f"{', dual-filtered' if iteration >= 2 else ''})", fontsize=10.5)
+    ax_map.set_title(f"QAOA sub-tour, node {curr_node}"
+                      f"{' (dual-filtered)' if iteration >= 2 else ''}", fontsize=10)
     ax_map.legend(loc="best", fontsize=8)
     _style_axes(ax_map)
 
@@ -260,7 +260,7 @@ def _frame_pricing_node(
                        color="#a03030", style="italic")
 
     fig.suptitle(f"Step 2 \u2014 Pricing Subproblem: node {curr_node}, iteration {iteration}", fontsize=13, y=0.99)
-    fig.subplots_adjust(top=0.86, wspace=0.35)
+    fig.subplots_adjust(top=0.86, wspace=0.55)
     _save_all_formats(
         fig, os.path.join(output_dir, f"02_{frame_idx:03d}_iter{iteration}_node{curr_node}"), formats
     )
