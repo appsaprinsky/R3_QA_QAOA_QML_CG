@@ -1,7 +1,7 @@
 """
 algo_hybrid_LRWSQAOA.py
 
-Algorithm Hybrid 2+5: Spatial Rolling WS-LR QAOA with Stochastic Exploration &
+Algorithm: Spatial Rolling WS-LR QAOA with Stochastic Exploration &
 Receding-Horizon Batch Commitment + LNS (Open TSP).
 
 Contains full quantum statevector QAOA simulator for local sub-tour optimization:

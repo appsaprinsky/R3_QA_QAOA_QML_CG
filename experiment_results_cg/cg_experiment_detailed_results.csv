@@ -1,7 +1,0 @@
-route_id,n_nodes,qubit_count,exploration_percent,xy_mixer,only_improving_columns,n_iterations_cap,amazon_cost,cg_cost,cost_diff_abs,cost_diff_pct,improvement_pct,runtime_sec,num_iterations_run,num_pool_columns_final,num_segments_selected,final_master_status,pre_2opt_cost,error
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,2,0.0,False,True,10,15090.3,13884.2,-1206.1,-7.99,7.99,50.627,9,1268,74,Optimal,16648.4,
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,2,0.2,False,True,10,15090.3,13884.2,-1206.1,-7.99,7.99,48.479,9,1268,74,Optimal,16648.4,
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,3,0.0,False,True,10,15090.3,14525.9,-564.4,-3.74,3.74,83.545,7,1239,70,Optimal,15338.1,
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,3,0.2,False,True,10,15090.3,14525.9,-564.4,-3.74,3.74,82.827,7,1239,70,Optimal,15338.1,
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,4,0.0,False,True,10,15090.3,15177.4,87.1,0.58,-0.58,1650.977,8,1582,73,Optimal,15520.7,
-RouteID_d9e8d1a2-f9f7-412f-a7de-db5c98c6829a,154,4,0.2,False,True,10,15090.3,15177.4,87.1,0.58,-0.58,1657.296,8,1582,73,Optimal,15520.7,

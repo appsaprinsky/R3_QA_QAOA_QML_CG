@@ -31,7 +31,7 @@ Unlike the closed TSP, there is no return edge $C_{\pi_{n-1}, \pi_0}$: the vehic
 
 Both algorithms below decompose \eqref{eq:opentsp} into small sub-tours over $k \ll n$ nodes (a \emph{qubit budget}, since each candidate node in a sub-tour occupies one binary variable per position in the underlying QUBO), solved with the Quantum Approximate Optimization Algorithm (QAOA), and reassembled classically into a full permutation.
 
-\section{Algorithm 1: Warm-Start Receding-Horizon QAOA (WS-LR-QAOA, ``Hybrid 2+5'')}
+\section{Algorithm 1: Warm-Start Receding-Horizon QAOA}
 \label{sec:hybrid}
 
 This is a pure heuristic construction: starting at the depot, it repeatedly solves a small QAOA sub-tour problem over the $k$ nearest (and optionally, exploratory) unvisited nodes, commits a batch of the first $b \le k$ nodes of the resulting order, and repeats from the new current node until every node has been visited. A closing 2-opt pass polishes the assembled tour.
@@ -115,7 +115,7 @@ Only the first $b \le k$ nodes of the decoded order (the \emph{batch}) are appen
 Once every node is committed, a standard open-path 2-opt local search repeatedly reverses sub-segments $[i,j]$ of the assembled tour whenever doing so strictly reduces $C_{\pi_{i-1},\pi_i} + C_{\pi_j,\pi_{j+1}} \to C_{\pi_{i-1},\pi_j} + C_{\pi_i,\pi_{j+1}}$ (with the obvious boundary case at $j = n{-}1$, since there is no return edge), until no improving move remains or an iteration cap is hit.
 
 \begin{algorithm}
-\caption{WS-LR-QAOA with Receding Horizon (Hybrid 2+5)}
+\caption{WS-LR-QAOA with Receding Horizon}
 \begin{algorithmic}[1]
 \State $\pi \gets [d]$; $u \gets d$; $U \gets \{0,\dots,n-1\}\setminus\{d\}$
 \While{$U \ne \emptyset$}

@@ -1,7 +1,7 @@
 """
 run_amazon_experiment.py
 
-Grid search experimental runner for Hybrid Algorithm 2+5 (WS-LR QAOA + LNS)
+Grid search experimental runner for Hybrid Algorithm (WS-LR QAOA + LNS)
 evaluated against Amazon Planned routes on the ALMRRC dataset.
 
 Grid Parameters:
@@ -123,14 +123,14 @@ def generate_overall_visualizations(data, hybrid_tour, hybrid_cost, param_str, o
     ax.legend(loc="upper left")
     ax.grid(True, linestyle=":", alpha=0.6)
 
-    # Hybrid QAOA 2+5 (With Depot)
+    # Hybrid QAOA (With Depot)
     ax = axes[1]
     p_hybrid = coords[hybrid_tour]
-    ax.plot(p_hybrid[:, 0], p_hybrid[:, 1], "g-o", linewidth=2, label=f"Hybrid 2+5 ({hybrid_cost:.2f})")
+    ax.plot(p_hybrid[:, 0], p_hybrid[:, 1], "g-o", linewidth=2, label=f"Hybrid WS-LR-QAOA with Receding Horizon ({hybrid_cost:.2f})")
     ax.scatter(coords[depot_idx, 0], coords[depot_idx, 1], c="red", s=180, marker="D", label="Depot", zorder=5)
     for i in range(len(coords)):
         ax.annotate(f" {i}", (coords[i, 0], coords[i, 1]), fontsize=9, weight="bold")
-    ax.set_title("Hybrid Algo 2+5 Route (With Depot)", fontsize=11, weight="bold")
+    ax.set_title("Hybrid WS-LR-QAOA with Receding Horizon Route (With Depot)", fontsize=11, weight="bold")
     ax.legend(loc="upper left")
     ax.grid(True, linestyle=":", alpha=0.6)
 
@@ -154,14 +154,14 @@ def generate_overall_visualizations(data, hybrid_tour, hybrid_cost, param_str, o
     ax.legend(loc="upper left")
     ax.grid(True, linestyle=":", alpha=0.6)
 
-    # Hybrid QAOA 2+5 (Without Depot)
+    # Hybrid QAOA (Without Depot)
     ax = axes[1]
     hybrid_no_depot = [i for i in hybrid_tour if i != depot_idx]
     p_hybrid_nd = coords[hybrid_no_depot]
-    ax.plot(p_hybrid_nd[:, 0], p_hybrid_nd[:, 1], "g-o", linewidth=2, label=f"Hybrid 2+5 ({hybrid_cost:.2f})")
+    ax.plot(p_hybrid_nd[:, 0], p_hybrid_nd[:, 1], "g-o", linewidth=2, label=f"Hybrid WS-LR-QAOA with Receding Horizon ({hybrid_cost:.2f})")
     for i in delivery_indices:
         ax.annotate(f" {i}", (coords[i, 0], coords[i, 1]), fontsize=9, weight="bold")
-    ax.set_title("Hybrid Algo 2+5 Route (Delivery Stops Only)", fontsize=11, weight="bold")
+    ax.set_title("Hybrid WS-LR-QAOA with Receding Horizon Route (Delivery Stops Only)", fontsize=11, weight="bold")
     ax.legend(loc="upper left")
     ax.grid(True, linestyle=":", alpha=0.6)
 
@@ -296,7 +296,7 @@ def run_experiment_grid(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Hybrid QAOA 2+5 Parameter Grid Search vs Amazon Baseline")
+    parser = argparse.ArgumentParser(description="Run Hybrid QAOA Parameter Grid Search vs Amazon Baseline")
     parser.add_argument("--data-dir", type=str, default="./almrrc2021-data-training", help="Dataset directory")
     parser.add_argument("--num-routes", type=int, default=100, help="Number of routes to sample (default: 10)")
     parser.add_argument("--output-dir", type=str, default="./experiment_results", help="Output directory for CSVs & plots")
