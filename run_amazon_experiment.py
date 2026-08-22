@@ -298,7 +298,7 @@ def run_experiment_grid(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Hybrid QAOA Parameter Grid Search vs Amazon Baseline")
     parser.add_argument("--data-dir", type=str, default="./almrrc2021-data-training", help="Dataset directory")
-    parser.add_argument("--num-routes", type=int, default=100, help="Number of routes to sample (default: 10)")
+    parser.add_argument("--num-routes", type=int, default=1000, help="Number of routes to sample (default: 10)")
     parser.add_argument("--output-dir", type=str, default="./experiment_results", help="Output directory for CSVs & plots")
     parser.add_argument("--no-plots", action="store_true", help="Disable generating visual plots to speed up runs")
     parser.add_argument("--seed", type=int, default=2026, help="Random seed")
