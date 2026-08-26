@@ -202,6 +202,22 @@ def _route_panel(ax, coords, path_indices, cmap_name, route_color, title, cost,
     leg = ax.legend(handles=legend_handles, loc="best", borderpad=0.8, labelspacing=0.6)
     leg.get_frame().set_boxstyle("round,pad=0.4,rounding_size=0.5")
 
+def _fit_label_text(s, max_chars=26, min_fontsize=8, base_fontsize=13):
+    """Long ALMRRC route IDs (UUID-length) were overflowing past the
+    scorecard's own column and overlapping the next field. Shrinks font
+    size as length grows; once even min_fontsize wouldn't fit, truncates
+    the middle (keeps start/end, where a route ID's distinguishing
+    characters usually are) instead of silently overlapping."""
+    s = str(s)
+    if len(s) <= max_chars:
+        return s, base_fontsize
+    overflow = len(s) - max_chars
+    fontsize = max(min_fontsize, base_fontsize - 0.35 * overflow)
+    if fontsize <= min_fontsize and len(s) > max_chars * 1.8:
+        keep = max_chars - 1
+        head, tail = keep // 2, keep - keep // 2
+        s = f"{s[:head]}\u2026{s[-tail:]}"
+    return s, fontsize
 
 def _draw_scorecard(fig, route_id, n_stops, amazon_cost, other_cost, algo_label, param_str):
     """
@@ -224,10 +240,17 @@ def _draw_scorecard(fig, route_id, n_stops, amazon_cost, other_cost, algo_label,
                           linewidth=1.0, edgecolor="#DDE0E4", facecolor="#FFFFFF", zorder=1)
     ax.add_patch(box)
 
-    ax.text(0.03, 0.5, f"Route {route_id}", transform=ax.transAxes,
-            ha="left", va="center", fontsize=13, fontweight="bold", color=COLOR_TEXT)
-    ax.text(0.03, 0.08, f"{n_stops} stops  \u2022  {param_str}", transform=ax.transAxes,
-            ha="left", va="bottom", fontsize=9, color="#7A7E86")
+    # ax.text(0.03, 0.5, f"Route {route_id}", transform=ax.transAxes,
+    #         ha="left", va="center", fontsize=13, fontweight="bold", color=COLOR_TEXT)
+    # ax.text(0.03, 0.08, f"{n_stops} stops  \u2022  {param_str}", transform=ax.transAxes,
+    #         ha="left", va="bottom", fontsize=9, color="#7A7E86")
+    route_label, route_fontsize = _fit_label_text(f"Route {route_id}", max_chars=26, base_fontsize=13)
+    ax.text(0.03, 0.5, route_label, transform=ax.transAxes, ha="left", va="center",
+            fontsize=route_fontsize, fontweight="bold", color=COLOR_TEXT)
+
+    subtitle, subtitle_fontsize = _fit_label_text(f"{n_stops} stops \u2022 {param_str}", max_chars=40, base_fontsize=9, min_fontsize=6.5)
+    ax.text(0.03, 0.08, subtitle, transform=ax.transAxes, ha="left", va="bottom",
+            fontsize=subtitle_fontsize, color="#7A7E86")
 
     ax.text(0.46, 0.5, f"Amazon: {amazon_cost:,.0f}", transform=ax.transAxes,
             ha="center", va="center", fontsize=12, color="#1f4e79")

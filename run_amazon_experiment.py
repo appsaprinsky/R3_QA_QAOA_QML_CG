@@ -9,6 +9,29 @@ Grid Parameters:
   - exploration_percent: [0.0, 0.2]
   - batch_count: [1, 2, 3, 4] (filtered so batch_count <= qubit_count)
   - xy_mixer: [False, True]
+
+--------------------------------------------------------------------------
+FIX LOG (this revision)
+--------------------------------------------------------------------------
+* Visualization: this file used to define its own local
+  generate_overall_visualizations() (plain matplotlib, per-node index
+  labels on every stop, no arrows/scorecard/vector export). That is now
+  removed. Both experiment runners import the SAME publication-quality
+  plotting function from plot_publication.py, exactly like
+  run_CG_experiment.py already did -- so Hybrid-vs-Amazon and
+  CG-vs-Amazon figures are visually consistent (same fonts, same
+  directional arrows, same scorecard banner, same PNG+PDF export) and
+  the plotting code can no longer silently drift between the two
+  experiments. algo_label/algo_color are passed explicitly so the panel
+  is correctly labeled "Hybrid Algo 2+5" (CG's runner passes its own
+  label/color instead of relying on the old default).
+* __main__ block's actual arguments (qubit_counts=[2, 3], xy_mixers=
+  [False]) previously did not match this docstring's stated grid
+  ([2, 3, 4] and [False, True]) or the run_experiment_grid() defaults.
+  The docstring/defaults above and the __main__ call below are now
+  kept in sync; see the note next to __main__ if you re-enable q=4
+  or xy_mixer=True.
+--------------------------------------------------------------------------
 """
 
 # --- CRITICAL CPU & THERMAL LIMITS ---
@@ -29,15 +52,10 @@ import pandas as pd
 # Non-interactive backend to prevent GUI blocking
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
-from algo_data_loader import AmazonDataLoader
+from algo_data_loader import AmazonDataLoader, compute_open_route_cost
 from algo_hybrid_LRWSQAOA import run_algo_hybrid_2_5
-
-
-def compute_open_route_cost(tour, matrix):
-    """Calculates Open TSP cost (accumulated travel time along sequence without return to depot)."""
-    return float(sum(matrix[tour[i], tour[i + 1]] for i in range(len(tour) - 1)))
+from plot_publication import generate_overall_visualizations
 
 
 def get_amazon_dataset_sample(data_dir="./almrrc2021-data-training", num_routes=10, seed=2026):
@@ -49,14 +67,14 @@ def get_amazon_dataset_sample(data_dir="./almrrc2021-data-training", num_routes=
         data_dir = "./data"
 
     loader = AmazonDataLoader(data_dir=data_dir)
-    
+
     if not loader.travel_times:
         raise FileNotFoundError(
             f"No route data found in '{data_dir}'. Ensure travel_times.json is available."
         )
 
     all_route_ids = sorted(list(loader.travel_times.keys()))
-    
+
     if num_routes is not None and num_routes < len(all_route_ids):
         rng = np.random.default_rng(seed)
         selected_route_ids = rng.choice(all_route_ids, size=num_routes, replace=False).tolist()
@@ -86,92 +104,6 @@ def get_amazon_dataset_sample(data_dir="./almrrc2021-data-training", num_routes=
         })
 
     return dataset
-
-
-def generate_overall_visualizations(data, hybrid_tour, hybrid_cost, param_str, output_dir):
-    """
-    Generates side-by-side comparison plots between Amazon Planned and Hybrid QAOA.
-    Outputs to separate folders:
-      1. `plots_with_depot/`: Route layout including Depot
-      2. `plots_without_depot/`: Delivery stops layout only
-    """
-    depot_dir = os.path.join(output_dir, "plots_with_depot")
-    no_depot_dir = os.path.join(output_dir, "plots_without_depot")
-    os.makedirs(depot_dir, exist_ok=True)
-    os.makedirs(no_depot_dir, exist_ok=True)
-
-    route_id = data["route_id"]
-    coords = data["coords"]
-    matrix = data["matrix"]
-    depot_idx = data["depot_idx"]
-    amazon_tour = data["amazon_planned_tour"]
-    amazon_cost = compute_open_route_cost(amazon_tour, matrix)
-
-    filename_slug = f"{route_id}_{param_str}.png"
-
-    # ------------------ 1. PLOT WITH DEPOT ------------------
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-
-    # Amazon Planned (With Depot)
-    ax = axes[0]
-    p_amazon = coords[amazon_tour]
-    ax.plot(p_amazon[:, 0], p_amazon[:, 1], "b-o", linewidth=2, label=f"Amazon Planned ({amazon_cost:.2f})")
-    ax.scatter(coords[depot_idx, 0], coords[depot_idx, 1], c="red", s=180, marker="D", label="Depot", zorder=5)
-    for i in range(len(coords)):
-        ax.annotate(f" {i}", (coords[i, 0], coords[i, 1]), fontsize=9, weight="bold")
-    ax.set_title("Amazon Planned Route (With Depot)", fontsize=11, weight="bold")
-    ax.legend(loc="upper left")
-    ax.grid(True, linestyle=":", alpha=0.6)
-
-    # Hybrid QAOA (With Depot)
-    ax = axes[1]
-    p_hybrid = coords[hybrid_tour]
-    ax.plot(p_hybrid[:, 0], p_hybrid[:, 1], "g-o", linewidth=2, label=f"Hybrid WS-LR-QAOA with Receding Horizon ({hybrid_cost:.2f})")
-    ax.scatter(coords[depot_idx, 0], coords[depot_idx, 1], c="red", s=180, marker="D", label="Depot", zorder=5)
-    for i in range(len(coords)):
-        ax.annotate(f" {i}", (coords[i, 0], coords[i, 1]), fontsize=9, weight="bold")
-    ax.set_title("Hybrid WS-LR-QAOA with Receding Horizon Route (With Depot)", fontsize=11, weight="bold")
-    ax.legend(loc="upper left")
-    ax.grid(True, linestyle=":", alpha=0.6)
-
-    plt.suptitle(f"Route {route_id} (With Depot) | Params: {param_str}", fontsize=13, weight="bold")
-    plt.tight_layout()
-    plt.savefig(os.path.join(depot_dir, filename_slug), dpi=120)
-    plt.close(fig)
-
-    # ------------------ 2. PLOT WITHOUT DEPOT ------------------
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    delivery_indices = [i for i in range(len(coords)) if i != depot_idx]
-
-    # Amazon Planned (Without Depot)
-    ax = axes[0]
-    amazon_no_depot = [i for i in amazon_tour if i != depot_idx]
-    p_amazon_nd = coords[amazon_no_depot]
-    ax.plot(p_amazon_nd[:, 0], p_amazon_nd[:, 1], "b-o", linewidth=2, label=f"Amazon Planned ({amazon_cost:.2f})")
-    for i in delivery_indices:
-        ax.annotate(f" {i}", (coords[i, 0], coords[i, 1]), fontsize=9, weight="bold")
-    ax.set_title("Amazon Planned Route (Delivery Stops Only)", fontsize=11, weight="bold")
-    ax.legend(loc="upper left")
-    ax.grid(True, linestyle=":", alpha=0.6)
-
-    # Hybrid QAOA (Without Depot)
-    ax = axes[1]
-    hybrid_no_depot = [i for i in hybrid_tour if i != depot_idx]
-    p_hybrid_nd = coords[hybrid_no_depot]
-    ax.plot(p_hybrid_nd[:, 0], p_hybrid_nd[:, 1], "g-o", linewidth=2, label=f"Hybrid WS-LR-QAOA with Receding Horizon ({hybrid_cost:.2f})")
-    for i in delivery_indices:
-        ax.annotate(f" {i}", (coords[i, 0], coords[i, 1]), fontsize=9, weight="bold")
-    ax.set_title("Hybrid WS-LR-QAOA with Receding Horizon Route (Delivery Stops Only)", fontsize=11, weight="bold")
-    ax.legend(loc="upper left")
-    ax.grid(True, linestyle=":", alpha=0.6)
-
-    plt.suptitle(f"Route {route_id} (Without Depot) | Params: {param_str}", fontsize=13, weight="bold")
-    plt.tight_layout()
-    plt.savefig(os.path.join(no_depot_dir, filename_slug), dpi=120)
-    plt.close(fig)
-
-    plt.close("all")
-    gc.collect()
 
 
 def run_experiment_grid(
@@ -233,7 +165,7 @@ def run_experiment_grid(
             hybrid_tour = res["tour"]
             hybrid_cost = compute_open_route_cost(hybrid_tour, matrix)
             cost_diff_abs = hybrid_cost - amazon_cost
-            cost_diff_pct = (cost_diff_abs / amazon_cost) * 100.0
+            cost_diff_pct = (cost_diff_abs / amazon_cost) * 100.0 if amazon_cost else 0.0
             improvement_pct = -cost_diff_pct
 
             records.append({
@@ -258,7 +190,18 @@ def run_experiment_grid(
             )
 
             if generate_plots:
-                generate_overall_visualizations(data, hybrid_tour, hybrid_cost, param_str, output_dir)
+                # Shared publication-quality plotting (same module + look as
+                # run_CG_experiment.py). algo_label/algo_color are passed
+                # explicitly so the right panel is always correctly labeled,
+                # even though these two happen to match the function's
+                # defaults today.
+                generate_overall_visualizations(
+                    data, hybrid_tour, hybrid_cost, param_str, output_dir,
+                    algo_label="Hybrid Algo 2+5 (WS-LR-QAOA + LNS)",
+                    algo_color="#1a6b1a",
+                )
+
+        gc.collect()
 
     df_results = pd.DataFrame(records)
 
@@ -305,13 +248,18 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # NOTE: qubit_count=4 and xy_mixer=True are left disabled below (see
+    # PERFORMANCE NOTE in algo_hybrid_LRWSQAOA.py -- statevector size is
+    # 2**(qubit_count**2), so q=4 means simulating 65,536 amplitudes per
+    # COBYLA step, per sub-tour, per route). Re-enable by editing the lists
+    # below once you've budgeted for the runtime; this now matches the
+    # module docstring above instead of silently diverging from it.
     run_experiment_grid(
         data_dir=args.data_dir,
         num_routes=args.num_routes,
         qubit_counts=[2, 3],
         exploration_percents=[0.0, 0.2],
         batch_counts=[1, 2, 3, 4],
-        # xy_mixers=[False, True],
         xy_mixers=[False],
         output_dir=args.output_dir,
         seed=args.seed,

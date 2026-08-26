@@ -274,7 +274,7 @@ if __name__ == "__main__":
         description="Run CG Hybrid LRWSQAOA-Sub Parameter Grid Search vs Amazon Baseline"
     )
     parser.add_argument("--data-dir", type=str, default="./almrrc2021-data-training", help="Dataset directory")
-    parser.add_argument("--num-routes", type=int, default=1, help="Number of routes to sample")
+    parser.add_argument("--num-routes", type=int, default=1000, help="Number of routes to sample")
     parser.add_argument("--output-dir", type=str, default="./experiment_results_cg", help="Output directory for CSVs & plots")
     parser.add_argument("--no-plots", action="store_true", help="Disable generating visual plots to speed up runs")
     parser.add_argument("--seed", type=int, default=2026, help="Random seed")
@@ -293,7 +293,7 @@ if __name__ == "__main__":
     run_cg_experiment_grid(
         data_dir=args.data_dir,
         num_routes=args.num_routes,
-        qubit_counts=(2, 3, 4),
+        qubit_counts=(2, 3),
         exploration_percents=(0.0, 0.2),
         xy_mixers=(False,),
         only_improving_columns_options=(True,),

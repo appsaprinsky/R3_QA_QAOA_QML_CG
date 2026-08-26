@@ -121,6 +121,17 @@ def _frame_pricing_map_only(frame_idx, coords, matrix, curr_node, nearest, explo
     ax.set_title(f"QAOA sub-tour from node {curr_node}"
                  f"{' (dual-filtered)' if iteration >= 2 else ''}", fontsize=12.5)
     ax.legend(loc="best", fontsize=9)
+    focus_idx = [curr_node] + nearest + explore
+    focus_coords = coords[focus_idx]
+    xmin, xmax = focus_coords[:, 0].min(), focus_coords[:, 0].max()
+    ymin, ymax = focus_coords[:, 1].min(), focus_coords[:, 1].max()
+    span = max(xmax - xmin, ymax - ymin, 1e-6)
+    pad = max(span * 0.6, 3.0)  # generous padding + floor so a tight cluster doesn't over-zoom
+    cx, cy = (xmin + xmax) / 2, (ymin + ymax) / 2
+    half = span / 2 + pad
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+    ax.set_aspect("equal", adjustable="box")  # "box", not "datalim" — keeps these explicit limits
     _style_axes(ax)
 
     fig.suptitle(f"Step 2 \u2014 Pricing Subproblem: node {curr_node}, iteration {iteration}", fontsize=14)

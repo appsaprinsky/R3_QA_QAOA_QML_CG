@@ -315,7 +315,13 @@ def _solve_master(columns, node_ids, relaxation, time_limit=60):
 
     prob = pulp.LpProblem("CG_Master_SetPartition", pulp.LpMinimize)
     cat = pulp.LpContinuous if relaxation else pulp.LpBinary
-    x = [pulp.LpVariable(f"x_{i}", lowBound=0, upBound=1, cat=cat) for i in range(len(columns))]
+    # x = [pulp.LpVariable(f"x_{i}", lowBound=0, upBound=1, cat=cat) for i in range(len(columns))]
+    def _make_var(prob, name, low, high, cat):
+        if hasattr(prob, "add_variable"):
+            return prob.add_variable(name, lowBound=low, upBound=high, cat=cat)
+        return pulp.LpVariable(name, lowBound=low, upBound=high, cat=cat)
+
+    x = [_make_var(prob, f"x_{i}", 0, 1, cat) for i in range(len(columns))]
 
     prob += pulp.lpSum(columns[i]["cost"] * x[i] for i in range(len(columns)))
 
