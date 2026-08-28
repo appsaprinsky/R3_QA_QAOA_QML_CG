@@ -131,6 +131,39 @@ Amazon routes (100-250+ stops) this is not free; `max_pricing_nodes`
 lets you subsample starting nodes per iteration instead of using
 literally every one, and lowering ITERATION_CG is the other direct
 lever if a run is too slow.
+
+--------------------------------------------------------------------------
+FIX LOG (this revision)
+--------------------------------------------------------------------------
+* _solve_master(): TWO separate PuLP deprecation warnings were still
+  firing (a previous revision already fixed a THIRD one, the
+  LpVariable-construction warning, via _make_var below):
+    1. `prob.constraints[cname]` (dict-style access) -- deprecated in
+       favor of `prob.get_constraint_by_name(name)`. This was called
+       ONCE PER NODE, every LP relaxation solve (i.e. up to n * 10 times
+       per single run_cg_hybrid_lrwsqaoa_sub() call on a 250-stop
+       route) -- at default warnings settings Python only shows/records
+       a given warning once per call site and normally fast-paths
+       identical repeats, but the "show every warning" wrapper used by
+       run_experiment_ALL.py's warning capture (warnings.simplefilter
+       ("always")) disabled that fast path, so those thousands of
+       nearly-identical warnings were being individually constructed,
+       formatted, and processed -- a real, measurable contributor to
+       "the code got slower". Fixed via _get_constraint() below, which
+       uses the new API when available and only falls back to the old
+       dict access (with the warning intact) on PuLP versions that
+       don't have get_constraint_by_name yet.
+    2. `pulp.PULP_CBC_CMD` -- deprecated in favor of `pulp.COIN_CMD`
+       (which needs the `pulp[cbc]` extra installed to find a CBC
+       binary, so blindly switching to it could break environments that
+       don't have that extra). Fixed via _make_master_solver() below:
+       tries COIN_CMD once, caches whether it's actually usable at the
+       MODULE level (not per solve -- probing solver availability on
+       every single LP/ILP solve would itself be a performance
+       regression, and _solve_master is called up to n_iterations+1
+       times per run), and falls back to PULP_CBC_CMD (with its own
+       deprecation warning locally suppressed, since the fallback here
+       is intentional, not an oversight) if COIN_CMD isn't usable.
 --------------------------------------------------------------------------
 """
 
@@ -259,7 +292,7 @@ def _nearest_and_explore_candidates(curr_node, exclude, matrix, k, exploration_p
     return nearest + explore
 
 
-def _two_opt_open_tsp(tour, matrix, max_iter=100):
+def _two_opt_open_tsp(tour, matrix, max_iter=1000):
     """
     Same style of open-TSP 2-opt local search used in
     algo_hybrid_LRWSQAOA.py's run_algo_hybrid_2_5 -- reimplemented here
@@ -298,6 +331,72 @@ def _two_opt_open_tsp(tour, matrix, max_iter=100):
 # Master problem (PuLP set-partitioning LP / ILP)
 # =====================================================================
 
+# Cached across calls -- see FIX LOG. `None` = not yet probed;
+# afterwards either "coin" or "cbc". Probing solver availability
+# (spawning/checking for a binary) is NOT something to do on every one
+# of the up-to-(n_iterations+1) master solves in a single run.
+_CACHED_SOLVER_CLASS = None
+
+
+def _make_var(prob, name, low, high, cat):
+    """
+    PuLP 4.0 deprecates constructing LpVariable directly in favor of
+    prob.add_variable(...), which attaches the variable to the problem
+    at creation time. Version-safe: uses the new method when available,
+    falls back to the old constructor on PuLP versions that don't have
+    add_variable yet.
+    """
+    if hasattr(prob, "add_variable"):
+        return prob.add_variable(name, lowBound=low, upBound=high, cat=cat)
+    return pulp.LpVariable(name, lowBound=low, upBound=high, cat=cat)
+
+
+def _get_constraint(prob, name):
+    """
+    PuLP 4.0 deprecates dict-style prob.constraints[name] access in favor
+    of prob.get_constraint_by_name(name) (per that version's own
+    deprecation message). Version-safe: uses the new method when
+    available, falls back to the old dict access on older PuLP. See FIX
+    LOG above for why this one specifically mattered for performance,
+    not just warning noise.
+    """
+    if hasattr(prob, "get_constraint_by_name"):
+        return prob.get_constraint_by_name(name)
+    return prob.constraints[name]
+
+
+def _make_master_solver(time_limit):
+    """
+    PuLP 4.0 deprecates PULP_CBC_CMD in favor of COIN_CMD (per that
+    version's own deprecation message: "Install CBC with
+    `pip install pulp[cbc]` and use COIN_CMD instead"). COIN_CMD needs
+    the `pulp[cbc]` extra actually installed to find a CBC binary, which
+    may not be true in every environment this runs in -- so this probes
+    COIN_CMD's availability ONCE per process (cached in
+    _CACHED_SOLVER_CLASS, not re-probed on every master solve -- see FIX
+    LOG) and falls back to PULP_CBC_CMD, with its own deprecation
+    warning locally suppressed since the fallback here is deliberate.
+    """
+    global _CACHED_SOLVER_CLASS
+
+    if _CACHED_SOLVER_CLASS is None:
+        _CACHED_SOLVER_CLASS = "cbc"
+        if hasattr(pulp, "COIN_CMD"):
+            try:
+                probe = pulp.COIN_CMD(msg=0)
+                if probe.available():
+                    _CACHED_SOLVER_CLASS = "coin"
+            except Exception:
+                pass
+
+    if _CACHED_SOLVER_CLASS == "coin":
+        return pulp.COIN_CMD(msg=0, timeLimit=time_limit)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*PULP_CBC_CMD is deprecated.*")
+        return pulp.PULP_CBC_CMD(msg=0, timeLimit=time_limit)
+
+
 def _solve_master(columns, node_ids, relaxation, time_limit=60):
     """
     columns: list of dicts with at least {"nodes": [...], "cost": float}
@@ -315,12 +414,6 @@ def _solve_master(columns, node_ids, relaxation, time_limit=60):
 
     prob = pulp.LpProblem("CG_Master_SetPartition", pulp.LpMinimize)
     cat = pulp.LpContinuous if relaxation else pulp.LpBinary
-    # x = [pulp.LpVariable(f"x_{i}", lowBound=0, upBound=1, cat=cat) for i in range(len(columns))]
-    def _make_var(prob, name, low, high, cat):
-        if hasattr(prob, "add_variable"):
-            return prob.add_variable(name, lowBound=low, upBound=high, cat=cat)
-        return pulp.LpVariable(name, lowBound=low, upBound=high, cat=cat)
-
     x = [_make_var(prob, f"x_{i}", 0, 1, cat) for i in range(len(columns))]
 
     prob += pulp.lpSum(columns[i]["cost"] * x[i] for i in range(len(columns)))
@@ -342,7 +435,7 @@ def _solve_master(columns, node_ids, relaxation, time_limit=60):
             )
         coverage_constraint_names[node] = cname
 
-    solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=time_limit)
+    solver = _make_master_solver(time_limit)
     prob.solve(solver)
 
     status = pulp.LpStatus[prob.status]
@@ -351,7 +444,7 @@ def _solve_master(columns, node_ids, relaxation, time_limit=60):
     duals = {}
     if relaxation:
         for node, cname in coverage_constraint_names.items():
-            constr = prob.constraints[cname]
+            constr = _get_constraint(prob, cname)
             duals[node] = constr.pi if constr.pi is not None else 0.0
 
     selected = [i for i, v in enumerate(x_values) if v is not None and v > 0.5]

@@ -36,18 +36,19 @@ separate output directories:
         better, per route."
       visualise_experiments_ALL/
         heuristic_vs_amazon/
-          plots_with_depot/       Amazon vs. Heuristic, one figure per route
+          plots_with_depot/       Amazon vs. Heuristic, one figure PER
+                                   QUBIT COUNT tested, per route (see
+                                   --plot-granularity below)
           plots_without_depot/    same, depot excluded
         cg_vs_amazon/
-          plots_with_depot/       Amazon vs. CG, one figure per route
+          plots_with_depot/       Amazon vs. CG, one figure per qubit
+                                   count tested, per route
           plots_without_depot/    same, depot excluded
-        (all PNG + PDF, via plot_publication.generate_overall_visualizations
-        -- the SAME 2-panel figure function run_amazon_experiment.py and
+        (PNG by default -- see --plot-formats -- via
+        plot_publication.generate_overall_visualizations, the SAME
+        2-panel figure function run_amazon_experiment.py and
         run_CG_experiment.py already use, called once per algorithm per
-        route rather than folded into a single combined figure. An
-        earlier version of this script drew one 3-panel Amazon|Heuristic|
-        CG figure; that made both algorithms' routes harder to read at
-        once and is no longer how this script plots.)
+        route rather than folded into a single combined figure.)
 
 Design notes
 ------------
@@ -69,16 +70,47 @@ Design notes
   the reporting layer (the three CSVs above), not by forcing a shared
   parameter space that doesn't actually exist between the two
   algorithms.
-* Visualization defaults to ONE Amazon-vs-Heuristic figure and ONE
-  Amazon-vs-CG figure per route (the best result from each algorithm's
-  grid), not one figure per grid combination -- with two full grids run
-  for every one of potentially 1000 routes, plotting every combination
-  would produce an unmanageable number of files. Pass --plot-all-combos
-  to instead render every grid combination for both algorithms
-  (Heuristic's and CG's grids independently -- there is no longer a
-  cross-product between them now that each is plotted against Amazon
-  separately); this is almost certainly not what you want above a
-  handful of routes.
+
+--------------------------------------------------------------------------
+FIX LOG (this revision)
+--------------------------------------------------------------------------
+* Plotting granularity: a previous revision's default ("best" -- plot
+  ONLY the single overall-best config across the WHOLE grid) meant that
+  if, say, qubit_count=2 always happened to win for CG on every route
+  and qubit_count=3 always won for Heuristic, EVERY plot you'd ever see
+  was q2-for-CG and q3-for-Heuristic -- other qubit counts you explicitly
+  configured never got a figure at all, which reads as "the same picture
+  saved twice" rather than "here's what each qubit count actually
+  produced". New default ("per_qubit"): one figure per DISTINCT qubit
+  count tested, per algorithm, per route (using that qubit count's own
+  best result across the other params) -- so a 2-qubit-count grid now
+  reliably produces 2 different figures per algorithm per route, not 1.
+  The old exhaustive "every single grid combination" behavior is still
+  available (now via --plot-granularity all, same thing --plot-all-combos
+  used to trigger; that flag is kept as a backward-compatible alias).
+* Plot formats: previously always PNG *and* PDF (both docstring-implied
+  and hardcoded via generate_overall_visualizations' own default).
+  Combined with per-qubit-count plotting producing MORE distinct figures
+  than the old best-only default, that would have meant materially more
+  total file saves per route than before. Default is now PNG only
+  (`--plot-formats png pdf` to get both back) -- this alone roughly
+  halves per-figure save time (no vector PDF re-render) and, combined
+  with per-qubit plotting replacing what used to be duplicate-looking
+  best-only saves, keeps total output volume comparable to before while
+  actually showing the qubit-count variation you configured.
+* _run_cg_grid_for_route's warnings.catch_warnings(record=True) +
+  warnings.simplefilter("always") wrapper (added to surface PuLP
+  deprecation warnings during earlier debugging) is removed. Those
+  warnings are now fixed at the source in cg_hybrid_lrwsqaoa_sub.py
+  (see its own FIX LOG), so there's nothing left to force-capture here
+  -- and simplefilter("always") disables Python's normal
+  once-per-call-site de-duplication for ANY warning that does fire,
+  which on a real ~150-250 stop route meant thousands of near-identical
+  warning objects being individually constructed and processed instead
+  of shown once. Ordinary default warning handling (each unique warning
+  prints once) is what's left, which is what you want in a long batch
+  run anyway.
+--------------------------------------------------------------------------
 """
 
 # --- CRITICAL CPU & THERMAL LIMITS (matches both standalone scripts) ---
@@ -115,7 +147,14 @@ from plot_publication import generate_overall_visualizations
 def get_amazon_dataset_sample(data_dir="./almrrc2021-data-training", num_routes=10, seed=2026):
     """Loads real ALMRRC routes. Identical logic/seed handling to both
     standalone scripts, so pointing any of the three scripts at the same
-    (data_dir, num_routes, seed) draws the same route sample."""
+    (data_dir, num_routes, seed) draws the same route sample.
+
+    NOTE: the `if coords is None or np.all(coords == 0)` MDS fallback
+    below is now a redundant safety net, not the primary fix -- the
+    actual reconstruction (which also handles the much more common case
+    of only SOME nodes missing metadata, not all of them) now happens
+    inside AmazonDataLoader.extract_single_route() itself. See
+    algo_data_loader.py's FIX LOG for why that distinction mattered."""
     if not os.path.exists(data_dir) and os.path.exists("./data"):
         data_dir = "./data"
 
@@ -163,6 +202,22 @@ def get_amazon_dataset_sample(data_dir="./almrrc2021-data-training", num_routes=
 # Per-route, per-algorithm grid execution
 # ---------------------------------------------------------------------
 
+def _best_per_qubit_count(records):
+    """Returns {qubit_count: best_record} across a list of run records --
+    the cheapest (lowest algo_cost) result found for each distinct
+    qubit_count, marginalizing over every other parameter. Used for the
+    default 'per_qubit' plotting granularity (see FIX LOG above).
+    Records with an error are skipped."""
+    best = {}
+    for rec in records:
+        if rec.get("error"):
+            continue
+        q = rec["qubit_count"]
+        if q not in best or rec["algo_cost"] < best[q]["algo_cost"]:
+            best[q] = rec
+    return best
+
+
 def _run_heuristic_grid_for_route(data, amazon_cost, param_grid, seed, keep_all_tours=False):
     """Runs Algorithm 1 over its full parameter grid for one route.
     Returns (records, best_record) where best_record is the row with
@@ -170,10 +225,9 @@ def _run_heuristic_grid_for_route(data, amazon_cost, param_grid, seed, keep_all_
 
     Tours are memory-expensive to retain across a full 1000-route x
     full-grid run, so by default only the best record's tour is kept
-    (best["_tour"]) -- enough for the default best-vs-best 3-way plot.
-    Pass keep_all_tours=True (wired up automatically when
-    --plot-all-combos is set) to retain every record's tour instead,
-    which --plot-all-combos needs to render every combo pairing."""
+    (best["_tour"]) -- enough for the 'best' plotting granularity.
+    Pass keep_all_tours=True (wired up automatically for the 'per_qubit'
+    and 'all' plotting granularities) to retain every record's tour."""
     matrix = data["matrix"]
     records = []
     best = None
@@ -227,15 +281,11 @@ def _run_cg_grid_for_route(data, amazon_cost, param_grid, max_pricing_nodes, n_i
         param_str = f"cg_q{q}_exp{int(exp*100)}_xy{1 if xy else 0}_imp{1 if only_improving else 0}"
         t0 = time.time()
         try:
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                res = run_cg_hybrid_lrwsqaoa_sub(
-                    data, qubit_count=q, exploration_percent=exp, xy_mixer=xy,
-                    only_improving_columns=only_improving, max_pricing_nodes=max_pricing_nodes,
-                    n_iterations=n_iterations, time_limit=time_limit, seed=seed,
-                )
-                for w in caught:
-                    print(f"    [warning] {w.message}")
+            res = run_cg_hybrid_lrwsqaoa_sub(
+                data, qubit_count=q, exploration_percent=exp, xy_mixer=xy,
+                only_improving_columns=only_improving, max_pricing_nodes=max_pricing_nodes,
+                n_iterations=n_iterations, time_limit=time_limit, seed=seed,
+            )
         except Exception as e:
             elapsed = time.time() - t0
             records.append({
@@ -306,12 +356,16 @@ def run_all_experiment_grid(
     cg_time_limit=60,
     # --- Visualization ---
     generate_plots=True,
-    plot_all_combos=False,
+    plot_granularity="per_qubit",   # "best" | "per_qubit" | "all"
+    plot_formats=("png",),
     plot_max_routes=None,
 ):
     """Runs both algorithms' full grids, for every route in the sample,
-    and writes the three combined CSVs + the 3-way comparison figures
-    described in the module docstring."""
+    and writes the three combined CSVs + comparison figures described in
+    the module docstring."""
+    if plot_granularity not in ("best", "per_qubit", "all"):
+        raise ValueError(f"plot_granularity must be 'best', 'per_qubit', or 'all', got {plot_granularity!r}")
+
     os.makedirs(output_dir, exist_ok=True)
     viz_dir = os.path.join(output_dir, "visualise_experiments_ALL")
     heuristic_viz_dir = os.path.join(viz_dir, "heuristic_vs_amazon")
@@ -337,6 +391,7 @@ def run_all_experiment_grid(
         f"\n  Heuristic Grid Combos   : {len(heuristic_grid)}"
         f"\n  CG Grid Combos          : {len(cg_grid)}"
         f"\n  CG Pricing Iterations   : {cg_n_iterations} (cap; may converge earlier)"
+        f"\n  Plot Granularity        : {plot_granularity}  (formats: {', '.join(plot_formats)})"
         f"\n  Total Algorithm Runs    : {len(routes_data) * (len(heuristic_grid) + len(cg_grid))}\n"
     )
 
@@ -353,7 +408,9 @@ def run_all_experiment_grid(
         t_route_start = time.time()
 
         will_plot_this_route = generate_plots and (plot_max_routes is None or r_idx <= plot_max_routes)
-        keep_all = will_plot_this_route and plot_all_combos
+        # "per_qubit" needs every record's tour (one per qubit count),
+        # not just the single overall best -- see _best_per_qubit_count.
+        keep_all = will_plot_this_route and plot_granularity in ("per_qubit", "all")
 
         h_records, h_best = _run_heuristic_grid_for_route(
             data, amazon_cost, heuristic_grid, seed, keep_all_tours=keep_all,
@@ -399,7 +456,7 @@ def run_all_experiment_grid(
         })
 
         if will_plot_this_route:
-            if plot_all_combos:
+            if plot_granularity == "all":
                 # keep_all_tours=True above guarantees every h_records /
                 # c_records entry carries its own "_tour". Each
                 # algorithm is plotted against Amazon independently --
@@ -409,25 +466,39 @@ def run_all_experiment_grid(
                 for hr in h_records:
                     generate_overall_visualizations(
                         data, hr["_tour"], hr["algo_cost"], hr["param_str"], heuristic_viz_dir,
-                        algo_label="Heuristic (WS-LR-QAOA)", algo_color="#1a6b1a",
+                        algo_label="Heuristic (WS-LR-QAOA)", algo_color="#1a6b1a", formats=plot_formats,
                     )
                 for cr in c_records:
                     if cr.get("error"):
                         continue
                     generate_overall_visualizations(
                         data, cr["_tour"], cr["algo_cost"], cr["param_str"], cg_viz_dir,
-                        algo_label="CG (TDE-QP)", algo_color="#6a3d9a",
+                        algo_label="CG (TDE-QP)", algo_color="#6a3d9a", formats=plot_formats,
                     )
-            else:
+            elif plot_granularity == "per_qubit":
+                # One figure per DISTINCT qubit count tested, per
+                # algorithm -- see FIX LOG above for why this replaced
+                # "best" as the default.
+                for q, hr in sorted(_best_per_qubit_count(h_records).items()):
+                    generate_overall_visualizations(
+                        data, hr["_tour"], hr["algo_cost"], hr["param_str"], heuristic_viz_dir,
+                        algo_label="Heuristic (WS-LR-QAOA)", algo_color="#1a6b1a", formats=plot_formats,
+                    )
+                for q, cr in sorted(_best_per_qubit_count(c_records).items()):
+                    generate_overall_visualizations(
+                        data, cr["_tour"], cr["algo_cost"], cr["param_str"], cg_viz_dir,
+                        algo_label="CG (TDE-QP)", algo_color="#6a3d9a", formats=plot_formats,
+                    )
+            else:  # "best"
                 if h_best:
                     generate_overall_visualizations(
                         data, h_best["_tour"], h_best["algo_cost"], h_best["param_str"], heuristic_viz_dir,
-                        algo_label="Heuristic (WS-LR-QAOA)", algo_color="#1a6b1a",
+                        algo_label="Heuristic (WS-LR-QAOA)", algo_color="#1a6b1a", formats=plot_formats,
                     )
                 if c_best:
                     generate_overall_visualizations(
                         data, c_best["_tour"], c_best["algo_cost"], c_best["param_str"], cg_viz_dir,
-                        algo_label="CG (TDE-QP)", algo_color="#6a3d9a",
+                        algo_label="CG (TDE-QP)", algo_color="#6a3d9a", formats=plot_formats,
                     )
 
         gc.collect()
@@ -507,9 +578,15 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="./experiment_results_all", help="Output directory for CSVs & plots")
     parser.add_argument("--seed", type=int, default=2026, help="Random seed (shared route sample + algorithm seeding)")
     parser.add_argument("--no-plots", action="store_true", help="Disable generating visual plots entirely")
+    parser.add_argument("--plot-granularity", type=str, default="per_qubit", choices=["best", "per_qubit", "all"],
+                        help="'best': one overall-best figure per algorithm per route. 'per_qubit' (default): "
+                             "one figure per DISTINCT qubit count tested per algorithm per route. 'all': every "
+                             "single grid combination (MANY files above a handful of routes).")
     parser.add_argument("--plot-all-combos", action="store_true",
-                        help="Plot every (heuristic-combo x cg-combo) pairing per route instead of only the "
-                             "best-vs-best comparison. Produces MANY files above a handful of routes.")
+                        help="Deprecated alias for --plot-granularity all (kept for backward compatibility).")
+    parser.add_argument("--plot-formats", type=str, nargs="+", default=["png"], choices=["png", "pdf"],
+                        help="Which format(s) to save each figure in (default: png only -- add 'pdf' for "
+                             "vector/camera-ready output, at roughly double the per-figure save time).")
     parser.add_argument("--plot-max-routes", type=int, default=None,
                         help="Only generate plots for the first N routes in the sample (all routes still get "
                              "full CSV results). Useful to cap plot volume on large --num-routes runs.")
@@ -537,12 +614,14 @@ if __name__ == "__main__":
     parser.add_argument("--cg-max-pricing-nodes", type=int, default=None,
                         help="Subsample this many starting nodes for CG pricing instead of every node "
                              "(speed/quality tradeoff; default: every node, i.e. O(n) per iteration).")
-    parser.add_argument("--cg-iterations", type=int, default=ITERATION_CG,
+    parser.add_argument("--cg-iterations", type=int, default=30,#ITERATION_CG,
                         help=f"CG pricing iterations cap per run (default: ITERATION_CG={ITERATION_CG}).")
     parser.add_argument("--cg-time-limit", type=int, default=60,
                         help="CBC master-problem solver time limit (seconds) per solve.")
 
     args = parser.parse_args()
+
+    plot_granularity = "all" if args.plot_all_combos else args.plot_granularity
 
     run_all_experiment_grid(
         data_dir=args.data_dir,
@@ -561,6 +640,7 @@ if __name__ == "__main__":
         cg_n_iterations=args.cg_iterations,
         cg_time_limit=args.cg_time_limit,
         generate_plots=not args.no_plots,
-        plot_all_combos=args.plot_all_combos,
+        plot_granularity=plot_granularity,
+        plot_formats=tuple(args.plot_formats),
         plot_max_routes=args.plot_max_routes,
     )

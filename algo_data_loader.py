@@ -5,6 +5,31 @@ Parses Amazon PLANNED sequences from route_data.json and travel_times.json.
 --------------------------------------------------------------------------
 FIX LOG (this revision)
 --------------------------------------------------------------------------
+* THE ACTUAL ROOT CAUSE of "the visualization is unreadable, points look
+  too far apart" across MULTIPLE scripts (run_amazon_experiment.py,
+  run_CG_experiment.py, run_experiment_ALL.py, and especially
+  visualize_step_by_step_CG_REAL_DATA.py): a node missing from
+  stops_meta kept its default coords of (0, 0) -- a real lat/lng in the
+  Gulf of Guinea, nowhere near any real Amazon route. Every caller-side
+  fallback (`if coords is None or np.all(coords == 0): use MDS`) only
+  triggers when EVERY node is zero, not when a handful are -- so on any
+  route where a few (not all) stops were missing metadata, those (0,0)
+  points silently entered the coordinate array, stretched every plot's
+  auto-computed axis limits from "the size of a delivery zone" to "the
+  size of the Atlantic Ocean", and made the real ~100-250 point cluster
+  collapse to a single invisible dot in the corner of every figure.
+  A previous revision's FIX LOG already *described* handling this ("MDS
+  fallback triggers if any required node is missing, not just all") but
+  that was never actually wired up here -- only a warning was added; the
+  reconstruction itself was still left to each caller's now-provably-
+  insufficient np.all(coords==0) check. Fixed for real this time:
+  extract_single_route() now reconstructs coords for the WHOLE route via
+  classical MDS on the (always-complete) cost matrix whenever
+  missing_coord_nodes is non-empty -- not just when every node is
+  missing -- centralizing the fix at the single source every script
+  already loads through, instead of depending on 3-4 separate caller-
+  side checks staying in sync with what "degenerate" means.
+--------------------------------------------------------------------------
 * compute_route_cost(): previously computed a CLOSED-loop cost (added
   `cost_matrix[route_indices[-1], route_indices[0]]`, i.e. a return leg
   back to the start) and applied an ad hoc `/60.0 if total_cost > 1000`
@@ -35,13 +60,6 @@ FIX LOG (this revision)
 * extract_single_route(): depot_idx now breaks on the first "Station"
   stop and warns if more than one is found, instead of silently taking
   whichever "Station" happens to be last in dict-iteration order.
-* extract_single_route(): coords are now checked for missing per-node
-  metadata (previously a node missing from stops_meta silently kept
-  coords (0, 0), which is a real lat/lng in the Gulf of Guinea -- this
-  wouldn't trigger the MDS fallback, which only fires if *every* row is
-  zero, so a handful of missing nodes would silently plot at the origin
-  and distort the map). Missing nodes are now tracked and reported;
-  MDS fallback triggers if *any* required node is missing, not just all.
 --------------------------------------------------------------------------
 """
 
@@ -111,13 +129,17 @@ class AmazonDataLoader:
                 f"using the first one (index {depot_idx}) as depot_idx. "
                 f"Verify this is correct for this route."
             )
+
         if missing_coord_nodes:
             warnings.warn(
-                f"[{route_id}] {len(missing_coord_nodes)} node(s) missing from "
-                f"stops metadata, coords defaulted to (0, 0): "
-                f"{missing_coord_nodes[:5]}{'...' if len(missing_coord_nodes) > 5 else ''}. "
-                f"These will distort plots/MDS unless handled."
+                f"[{route_id}] {len(missing_coord_nodes)}/{n} node(s) missing from "
+                f"stops metadata: {missing_coord_nodes[:5]}"
+                f"{'...' if len(missing_coord_nodes) > 5 else ''}. "
+                f"Reconstructing coordinates for this route via MDS on the cost "
+                f"matrix (see FIX LOG) instead of leaving them at the (0, 0) "
+                f"default, which would otherwise distort every plot's axis scale."
             )
+            coords = _reconstruct_coords_via_mds(cost_matrix, route_id, existing_coords=coords)
 
         # --- Extract Amazon PLANNED Sequence ---
         planned_seq = []
@@ -232,6 +254,56 @@ class AmazonDataLoader:
         conditionally-rescaled) number under the same-looking name.
         """
         return compute_open_route_cost(route_indices, cost_matrix)
+
+
+def _reconstruct_coords_via_mds(cost_matrix, route_id, existing_coords):
+    """
+    Classical multidimensional scaling on the full pairwise cost matrix,
+    producing a 2D layout for EVERY node in the route -- not just the
+    ones that were missing metadata. This is deliberate: MDS needs one
+    globally consistent embedding to be meaningful (there's no principled
+    way to place only the missing points "relative to" the real ones
+    without re-running the same global optimization), and since
+    missing_coord_nodes is typically a small fraction of the route, the
+    resulting layout for the well-known majority of nodes still tracks
+    real relative geography closely -- while guaranteeing no (0, 0)
+    (or any other degenerate placeholder) can ever reach a plot again.
+
+    Used for VISUALIZATION LAYOUT ONLY. Every actual cost computation
+    anywhere in this codebase uses `cost_matrix` directly, never these
+    reconstructed coordinates -- MDS distances are an approximation of
+    the true travel costs, not a substitute for them.
+
+    Returns `existing_coords` unchanged if reconstruction fails, rather
+    than None -- callers should never have to guard against a None
+    coords array.
+    """
+    from sklearn.manifold import MDS
+
+    with warnings.catch_warnings():
+        # scikit-learn's own MDS emits several FutureWarnings about
+        # upcoming default changes (n_init, init, dissimilarity ->
+        # metric) that are irrelevant here -- we always pass
+        # dissimilarity="precomputed" and n_init explicitly, and don't
+        # want fixing the (0,0)-coordinate bug to trade it for a new
+        # source of warning spam.
+        warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn.*")
+        try:
+            mds = MDS(n_components=2, dissimilarity="precomputed", random_state=0,
+                      normalized_stress=False, n_init=4)
+        except TypeError:
+            # Older scikit-learn versions don't accept normalized_stress.
+            mds = MDS(n_components=2, dissimilarity="precomputed", random_state=0, n_init=4)
+
+        try:
+            return mds.fit_transform(cost_matrix)
+        except Exception as e:
+            warnings.warn(
+                f"[{route_id}] MDS coordinate reconstruction failed ({e}); "
+                f"falling back to the raw (possibly degenerate) coordinates. "
+                f"Plots for this route may still be distorted."
+            )
+            return existing_coords
 
 
 def compute_open_route_cost(tour, matrix):

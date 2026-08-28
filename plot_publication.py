@@ -29,6 +29,27 @@ Design choices, and why:
     Hybrid) visually consistent -- same fonts, same marker sizes, same
     spine/grid treatment -- so the only thing that differs between panels
     is the actual route data, which is the point of the comparison.
+
+--------------------------------------------------------------------------
+FIX LOG (this revision)
+--------------------------------------------------------------------------
+* _draw_scorecard: real ALMRRC route IDs are UUID-length strings
+  (e.g. "2ec84546-ac48-4a11-a3ac-6948889fdc76", 36 chars). At the
+  previous fixed fontsize=13, a route ID that long ran past its column
+  and overlapped the "Amazon: <cost>" text next to it. Added
+  _fit_label_text(), which shrinks the font size as the string grows
+  and, only once shrinking alone wouldn't keep it legible, truncates
+  the middle (keeping the start and end, which is where a route ID's
+  distinguishing characters usually are) instead of silently
+  overlapping neighboring text. Verified at production figure size
+  (20x10.5) against a realistic 36-char UUID route ID -- no overlap.
+* _plot_directional_route: arrow shaft length was a fixed fraction of
+  the AXIS diagonal only, with no relationship to the individual
+  segment it was drawn on -- on a tightly-zoomed view with only a few,
+  short segments (e.g. a k=2-4 QAOA candidate window), the arrow could
+  visually overrun or dominate the short edge it sat on. Arrow length
+  is now also capped to a fraction of that specific segment's own
+  length, and the arrowhead itself is smaller (mutation_scale 15 -> 10).
 """
 
 import os
@@ -86,6 +107,16 @@ def _plot_directional_route(ax, path_coords, color, linewidth=2.0, zorder=3, n_a
     Draws `path_coords` (an (N,2) array in visit order) as a single flat,
     fully-opaque, solid-color line -- no color/opacity gradient. Direction
     of travel is shown ONLY via a handful of arrowheads along the path.
+
+    FIX (this revision): arrow shaft length used to be a fixed fraction
+    of the AXIS diagonal only (diag * 0.03), with no relationship to how
+    long the actual segment it's drawn on is. On a tightly-zoomed view
+    with only a few, short segments (e.g. a k=2-4 candidate window,
+    zoomed to fit just those points), that fixed length could exceed the
+    segment's own length -- the arrow would visually dominate or overrun
+    a short edge instead of sitting neatly along it. Arrow length is now
+    also capped to a fraction of that specific segment's own length, and
+    the arrowhead itself (mutation_scale) is smaller.
     """
     if len(path_coords) < 2:
         return None
@@ -96,44 +127,60 @@ def _plot_directional_route(ax, path_coords, color, linewidth=2.0, zorder=3, n_a
         solid_capstyle="round", solid_joinstyle="round", zorder=zorder,
     )
 
-    # Direction arrows: a handful of fixed-size arrowheads along the path,
-    # scaled to the plot's own extent so they look consistent regardless
-    # of the route's coordinate range. Same solid color as the line.
+    # Direction arrows: a handful of arrowheads along the path, each
+    # sized against BOTH the plot's own extent (so long routes get
+    # visible, consistent arrows) AND that specific segment's own length
+    # (so short segments never get an oversized arrow -- see FIX above).
+    # Same solid color as the line.
     pts = path_coords.reshape(-1, 1, 2)
     segments = np.concatenate([pts[:-1], pts[1:]], axis=1)
     n_seg = len(segments)
 
     xlim, ylim = ax.get_xlim(), ax.get_ylim()
     diag = float(np.hypot(xlim[1] - xlim[0], ylim[1] - ylim[0]))
-    arrow_len = diag * 0.03
+    diag_arrow_len = diag * 0.03
 
     idxs = sorted(set(np.linspace(0, n_seg - 1, min(n_arrows, n_seg)).astype(int).tolist()))
     for i in idxs:
         p0, p1 = segments[i]
         direction = p1 - p0
-        norm = float(np.hypot(*direction))
-        if norm < 1e-9:
+        seg_len = float(np.hypot(*direction))
+        if seg_len < 1e-9:
             continue
-        unit = direction / norm
+        # Cap to 40% of this segment's own length, so the arrow always
+        # sits clearly within its edge instead of overrunning a short one.
+        arrow_len = min(diag_arrow_len, seg_len * 0.4)
+        if arrow_len < diag * 0.002:
+            continue  # too small to render meaningfully -- skip rather than draw a speck
+        unit = direction / seg_len
         mid = (p0 + p1) / 2.0
         tail = mid - unit * arrow_len / 2.0
         head = mid + unit * arrow_len / 2.0
         ax.annotate(
             "", xy=tuple(head), xytext=tuple(tail),
-            arrowprops=dict(arrowstyle="-|>", color=color, lw=1.9, mutation_scale=15),
+            arrowprops=dict(arrowstyle="-|>", color=color, lw=1.6, mutation_scale=10),
             zorder=zorder + 1,
         )
     return None
 
 
 def _mark_start_end(ax, path_coords, color, zorder=6):
+    """
+    `c=[color]` (a one-element list), not `c=color` -- when `color` is an
+    RGB/RGBA tuple (e.g. from a colormap's .colors, as _frame_final_master
+    uses for per-segment colors) and only one point is being scattered,
+    matplotlib can't tell whether a bare 3/4-tuple passed to `c=` means
+    "one color" or "three/four numeric values to colormap" and emits a
+    real (if harmless-in-outcome) warning on every call. Wrapping in a
+    list removes the ambiguity outright.
+    """
     shadow = [pe.SimplePatchShadow(offset=(1.2, -1.2), alpha=0.25), pe.Normal()]
     if len(path_coords) < 1:
         return
-    ax.scatter(*path_coords[0], marker="^", s=260, c=color, edgecolors="white",
+    ax.scatter(*path_coords[0], marker="^", s=260, c=[color], edgecolors="white",
                linewidths=1.4, zorder=zorder, label="_nolegend_", path_effects=shadow)
     if len(path_coords) > 1:
-        ax.scatter(*path_coords[-1], marker="s", s=210, c=color, edgecolors="white",
+        ax.scatter(*path_coords[-1], marker="s", s=210, c=[color], edgecolors="white",
                    linewidths=1.4, zorder=zorder, label="_nolegend_", path_effects=shadow)
 
 
@@ -202,12 +249,17 @@ def _route_panel(ax, coords, path_indices, cmap_name, route_color, title, cost,
     leg = ax.legend(handles=legend_handles, loc="best", borderpad=0.8, labelspacing=0.6)
     leg.get_frame().set_boxstyle("round,pad=0.4,rounding_size=0.5")
 
+
 def _fit_label_text(s, max_chars=26, min_fontsize=8, base_fontsize=13):
-    """Long ALMRRC route IDs (UUID-length) were overflowing past the
-    scorecard's own column and overlapping the next field. Shrinks font
-    size as length grows; once even min_fontsize wouldn't fit, truncates
-    the middle (keeps start/end, where a route ID's distinguishing
-    characters usually are) instead of silently overlapping."""
+    """
+    Real ALMRRC route IDs are UUID-length strings (~36 chars). At a fixed
+    fontsize this overflowed the scorecard's own column and overlapped
+    neighboring text (see FIX LOG above). Shrinks font size as the
+    string grows past `max_chars`; once even `min_fontsize` wouldn't
+    keep it legible, truncates the middle (keeping the start/end, which
+    is where a route ID's distinguishing characters usually are) rather
+    than letting it silently overlap.
+    """
     s = str(s)
     if len(s) <= max_chars:
         return s, base_fontsize
@@ -218,6 +270,7 @@ def _fit_label_text(s, max_chars=26, min_fontsize=8, base_fontsize=13):
         head, tail = keep // 2, keep - keep // 2
         s = f"{s[:head]}\u2026{s[-tail:]}"
     return s, fontsize
+
 
 def _draw_scorecard(fig, route_id, n_stops, amazon_cost, other_cost, algo_label, param_str):
     """
@@ -240,17 +293,17 @@ def _draw_scorecard(fig, route_id, n_stops, amazon_cost, other_cost, algo_label,
                           linewidth=1.0, edgecolor="#DDE0E4", facecolor="#FFFFFF", zorder=1)
     ax.add_patch(box)
 
-    # ax.text(0.03, 0.5, f"Route {route_id}", transform=ax.transAxes,
-    #         ha="left", va="center", fontsize=13, fontweight="bold", color=COLOR_TEXT)
-    # ax.text(0.03, 0.08, f"{n_stops} stops  \u2022  {param_str}", transform=ax.transAxes,
-    #         ha="left", va="bottom", fontsize=9, color="#7A7E86")
+    # Route ID and subtitle both go through _fit_label_text now instead
+    # of a fixed fontsize -- see FIX LOG above.
     route_label, route_fontsize = _fit_label_text(f"Route {route_id}", max_chars=26, base_fontsize=13)
-    ax.text(0.03, 0.5, route_label, transform=ax.transAxes, ha="left", va="center",
-            fontsize=route_fontsize, fontweight="bold", color=COLOR_TEXT)
+    ax.text(0.03, 0.5, route_label, transform=ax.transAxes,
+            ha="left", va="center", fontsize=route_fontsize, fontweight="bold", color=COLOR_TEXT)
 
-    subtitle, subtitle_fontsize = _fit_label_text(f"{n_stops} stops \u2022 {param_str}", max_chars=40, base_fontsize=9, min_fontsize=6.5)
-    ax.text(0.03, 0.08, subtitle, transform=ax.transAxes, ha="left", va="bottom",
-            fontsize=subtitle_fontsize, color="#7A7E86")
+    subtitle, subtitle_fontsize = _fit_label_text(
+        f"{n_stops} stops  \u2022  {param_str}", max_chars=40, base_fontsize=9, min_fontsize=6.5
+    )
+    ax.text(0.03, 0.08, subtitle, transform=ax.transAxes,
+            ha="left", va="bottom", fontsize=subtitle_fontsize, color="#7A7E86")
 
     ax.text(0.46, 0.5, f"Amazon: {amazon_cost:,.0f}", transform=ax.transAxes,
             ha="center", va="center", fontsize=12, color="#1f4e79")
@@ -286,11 +339,12 @@ def generate_overall_visualizations(
     give it its own color identity -- default matches the original
     Hybrid Algo 2+5 look exactly, so existing callers (e.g.
     run_amazon_experiment.py) are unaffected. Other callers (e.g.
-    run_CG_experiment.py) should pass their own algo_label/algo_color so
-    the right panel is correctly labeled instead of silently showing
-    "Hybrid Algo 2+5" for a different algorithm's results. algo_cmap is
-    accepted for backward compatibility but no longer affects rendering
-    (see _route_panel) -- only algo_color does.
+    run_CG_experiment.py, run_experiment_ALL.py) should pass their own
+    algo_label/algo_color so the right panel is correctly labeled
+    instead of silently showing "Hybrid Algo 2+5" for a different
+    algorithm's results. algo_cmap is accepted for backward
+    compatibility but no longer affects rendering (see _route_panel) --
+    only algo_color does.
     """
     from algo_data_loader import compute_open_route_cost  # single source of truth
 
@@ -353,7 +407,8 @@ def generate_overall_visualizations(
 
 if __name__ == "__main__":
     # Minimal smoke test with synthetic data, so this can be sanity-checked
-    # without the real Amazon dataset.
+    # without the real Amazon dataset. Uses a deliberately long, UUID-style
+    # route_id to exercise the _fit_label_text fix above.
     rng = np.random.default_rng(0)
     n = 60
     coords = rng.uniform(0, 100, size=(n, 2))
@@ -364,7 +419,7 @@ if __name__ == "__main__":
     hybrid_tour = [depot_idx] + list(rng.permutation(np.arange(1, n)))
 
     data = {
-        "route_id": "SMOKE_TEST",
+        "route_id": "2ec84546-ac48-4a11-a3ac-6948889fdc76",
         "coords": coords,
         "matrix": matrix,
         "depot_idx": depot_idx,
