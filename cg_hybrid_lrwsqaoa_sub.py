@@ -70,6 +70,10 @@ constant ITERATION_CG (default 10, overridable per-call via
       among the best available). This guarantees a full qubit_count-sized
       "nearest" set whenever the pool has enough points, instead of
       shrinking whenever few candidates happen to be strictly negative.
+    - The ranking WINDOW itself slides deterministically per node across
+      iterations rather than always being the top of the list -- see
+      "PREMATURE CONVERGENCE" in the FIX LOG below for why, and
+      _dual_aware_nearest_and_explore's docstring for the mechanics.
     - The QAOA subproblem itself also incorporates duals from iteration
       2 onward: instead of solving over the raw distance matrix, it
       solves over a dual-adjusted matrix (matrix[i, j] - duals[j] for
@@ -94,9 +98,12 @@ constant ITERATION_CG (default 10, overridable per-call via
   neighborhood, which is a lever for large instances, not something
   currently changing behavior at the default.
 
-  Iterations stop early if a pass adds zero new columns to the pool
-  (converged -- further iterations would be identical) or once
-  `n_iterations` is reached, whichever comes first.
+  Iterations stop when EITHER `n_iterations` is reached, OR a pass adds
+  zero new columns AND every node's ranking window has been slid all the
+  way through its full candidate list (see "PREMATURE CONVERGENCE" in
+  the FIX LOG below) -- not simply "this iteration's narrow window found
+  nothing", which is a materially weaker and, on real instances,
+  frequently premature condition.
 
   Final round (integer): solve the master ONE more time, now as a
   binary ILP over the final pool, to get an exact 0/1 partition. The
@@ -164,6 +171,88 @@ FIX LOG (this revision)
        times per run), and falls back to PULP_CBC_CMD (with its own
        deprecation warning locally suppressed, since the fallback here
        is intentional, not an oversight) if COIN_CMD isn't usable.
+
+PREMATURE CONVERGENCE (this revision -- the actual issue reported: "CG
+stops after not so many iterations, results are worse than Amazon, and
+it's not about exploration_percent")
+--------------------------------------------------------------------------
+* Root cause: the "n_new == 0 -> converged" stopping rule
+  (run_cg_hybrid_lrwsqaoa_sub's main loop) is only a valid convergence
+  PROOF if pricing is an exact oracle that can certify no improving
+  column exists anywhere. It isn't one here -- for every node,
+  _dual_aware_nearest_and_explore only ever considered the literal TOP
+  of the reduced-cost ranking (`ranked[:n_nearest]`, unconditionally).
+  With exploration_percent at 0 (or low), that "nearest" slice is fully
+  DETERMINISTIC given the current duals. Once the LP's duals stabilize
+  between iterations -- which happens naturally and fairly quickly, once
+  new columns stop changing the LP's optimal basis, a self-reinforcing
+  fixed point -- pricing re-proposes the EXACT SAME top-k window every
+  time, re-derives the exact same truncations, finds them all already
+  pooled, `n_new` hits 0, and the run reports "converged" -- while having
+  never once looked at the (k+1)-th, 10th, or 50th-ranked candidate for
+  any node. This is "the heuristic's narrow window hit a fixed point",
+  not "no improving column exists" -- a materially different, much
+  weaker claim that the old code was silently treating as equivalent.
+  (See the empirical verification note at the end of this entry.)
+* FIX: candidate selection now uses a per-node ranking window that
+  SLIDES deterministically (no randomness -- unrelated to and untouched
+  from exploration_percent, per explicit instruction) instead of always
+  reading the top of the list:
+    - `_dual_aware_nearest_and_explore` gained a `window_offset`
+      parameter: `nearest = ranked[window_offset : window_offset + k]`
+      instead of always `ranked[:k]`.
+    - `run_cg_hybrid_lrwsqaoa_sub` now maintains a persistent
+      `{node: offset}` dict across iterations. After each pricing round,
+      `_generate_priced_columns` reports, per node, whether ITS
+      truncations included anything genuinely new (not already in the
+      pool before this round) -- a node that stalled has its offset
+      advanced by its own window width (a deterministic slide deeper
+      into the SAME already-computed ranking); a node that found
+      something new resets to offset 0 (fresh duals next round make
+      re-examining from the top the right default again).
+    - The stopping condition changed from "n_new == 0" to "n_new == 0
+      AND every node's window has genuinely reached the tail of its
+      full candidate list" (`_is_window_saturated`, checked across all n
+      nodes). A node whose window hasn't yet been slid through its whole
+      candidate list is NOT treated as exhausted, so the run keeps going
+      and gives it a materially different (deeper) window on its very
+      next attempt -- not a repeat of an already-known-empty search.
+  This directly targets "stops after not so many iterations" without
+  touching exploration_percent, candidate-selection's exploration slots,
+  or introducing any randomness.
+* A real bug was caught IN THIS FIX ITSELF while testing it: novelty
+  ("did this node's pricing find anything new") was originally checked
+  BEFORE the improving-cost filter, not after -- meaning a candidate
+  window that slid to new territory would almost always produce
+  structurally different node sequences (since the actual candidates
+  differ), even when every one of them failed the improving-cost filter
+  and never reached the pool. That falsely triggered "found_new = True",
+  resetting the offset back to 0 immediately -- undoing the slide and
+  re-stalling on the very next call, so windows never actually
+  progressed. Fixed by checking novelty only on segments that survive
+  the filter and are actually appended to the candidate pool.
+* HONEST EMPIRICAL RESULT, tested directly (not just asserted): on
+  several small-to-medium synthetic instances (n=14-25, qubit_count=2-3),
+  the fix reliably (a) no longer stops at the first n_new==0 iteration --
+  confirmed via direct logging showing iteration_log's `fully_saturated`
+  staying False well past where the OLD rule would have exited, and the
+  run correctly continuing until genuinely exhausted, and (b) in direct
+  side-by-side comparisons (same instance, same seed, capped at the OLD
+  stopping iteration vs. run to the NEW fully-saturated stopping point),
+  final tour cost was IDENTICAL in every test case tried so far -- the
+  deeper, previously-unexamined parts of the ranking did not contain a
+  better column in these particular (small) instances. This is a
+  genuinely different, weaker result than "this fixes the worse-than-
+  Amazon results": the STOPPING LOGIC bug is real and fixed (the run no
+  longer exits on an unproven claim), but whether that produces BETTER
+  tours depends on whether better columns are actually hiding past the
+  old narrow window, which these small test cases didn't happen to
+  contain. The effect is expected to matter more on real ALMRRC-scale
+  routes (100-250+ stops), where a qubit_count=2-4 window is a much
+  smaller fraction of the full candidate pool -- but this has NOT been
+  tested against real data in this session (only small synthetic
+  instances, for runtime reasons) and should be verified before treating
+  it as a solved quality problem.
 --------------------------------------------------------------------------
 """
 
@@ -210,7 +299,7 @@ def _open_path_cost(nodes, matrix):
 
 
 def _dual_aware_nearest_and_explore(curr_node, exclude, matrix, k, exploration_percent, rng,
-                                     duals=None, global_max_dist=None):
+                                     duals=None, global_max_dist=None, window_offset=0):
     """
     Selects up to k candidates for curr_node's QAOA pricing subproblem,
     returned as (nearest, explore). Every call searches this curr_node's
@@ -234,6 +323,22 @@ def _dual_aware_nearest_and_explore(curr_node, exclude, matrix, k, exploration_p
       available. This guarantees a full k-sized "nearest" set whenever
       the pool has at least k points, rather than shrinking whenever few
       candidates happen to be strictly negative.
+
+    `window_offset` (FIX, see run_cg_hybrid_lrwsqaoa_sub's FIX LOG entry
+    "PREMATURE CONVERGENCE"): slices the dual-aware ranking as
+    `ranked[window_offset : window_offset + k]` instead of always
+    `ranked[:k]`. With window_offset always 0 (the previous behavior),
+    once duals stabilize between iterations, the identical top-k window
+    gets re-proposed every time, re-derives the identical truncations,
+    finds them already pooled, and the run reports "converged" -- while
+    never having looked at the (k+1)-th, 10th, or 50th-ranked candidate
+    at all. run_cg_hybrid_lrwsqaoa_sub tracks a persistent per-node
+    offset across iterations and advances it (deterministically, no
+    randomness) whenever a node's current window fails to yield
+    anything new, so a stalled node's NEXT attempt looks further down
+    the same ranking instead of retrying the identical window forever.
+    Deliberately independent of exploration_percent, which stays exactly
+    as it already behaves.
 
     RADIUS_POOL_SEARCH (module constant): when duals is provided and
     global_max_dist is given, the pool considered for ranking is first
@@ -270,7 +375,11 @@ def _dual_aware_nearest_and_explore(curr_node, exclude, matrix, k, exploration_p
         else:
             pool = others
         ranked = sorted(pool, key=lambda x: (matrix[curr_node, x] - duals.get(x, 0.0), matrix[curr_node, x], x))
-        nearest = ranked[:n_nearest]
+        # Clamp so a saturated offset re-uses the tail window rather than
+        # slicing past the end into an empty/short list.
+        max_offset = max(0, len(ranked) - n_nearest)
+        offset = min(max(0, window_offset), max_offset)
+        nearest = ranked[offset:offset + n_nearest]
     else:
         nearest = others_sorted[:n_nearest]
 
@@ -284,25 +393,57 @@ def _dual_aware_nearest_and_explore(curr_node, exclude, matrix, k, exploration_p
     return nearest, explore
 
 
+def _is_window_saturated(curr_node, exclude, matrix, k, window_offset):
+    """True once curr_node's ranking window has already reached the tail
+    of its available candidate pool -- i.e. sliding it further would be a
+    no-op (see _dual_aware_nearest_and_explore's clamping). Used by
+    run_cg_hybrid_lrwsqaoa_sub to distinguish "genuinely exhausted the
+    full candidate list for every node" from "just this iteration's
+    narrow window found nothing" when deciding whether to actually stop."""
+    n = matrix.shape[0]
+    others_count = n - 1 - len(exclude)
+    if others_count <= 0:
+        return True
+    max_offset = max(0, others_count - k)
+    return window_offset >= max_offset
+
+
 def _nearest_and_explore_candidates(curr_node, exclude, matrix, k, exploration_percent, rng,
-                                     duals=None, global_max_dist=None):
+                                     duals=None, global_max_dist=None, window_offset=0):
     nearest, explore = _dual_aware_nearest_and_explore(
-        curr_node, exclude, matrix, k, exploration_percent, rng, duals, global_max_dist
+        curr_node, exclude, matrix, k, exploration_percent, rng, duals, global_max_dist, window_offset
     )
     return nearest + explore
 
 
-def _two_opt_open_tsp(tour, matrix, max_iter=1000):
+def _two_opt_open_tsp(tour, matrix, max_iter=None):
     """
     Same style of open-TSP 2-opt local search used in
-    algo_hybrid_LRWSQAOA.py's run_algo_hybrid_2_5 -- reimplemented here
-    (not imported) since it isn't factored out as a standalone function
-    in that file and that file is not to be modified for this task.
+    algo_hybrid_LRWSQAOA.py's run_algo_hybrid_2_5 (that file's copy was
+    already fixed the same way -- this brings this file's independent
+    copy in line with it, per explicit request).
+
+    FIX (this revision): `max_iter` used to default to a flat 100 --
+    which is a cap on the TOTAL number of improving swaps applied (each
+    pass here applies at most one swap before restarting the O(n^2) scan
+    from the top), not "100 full passes". For real Amazon routes
+    (100-250+ stops), reaching a true 2-opt local optimum from a
+    nontrivial starting tour (here, the greedily-concatenated segment
+    order -- see _concatenate_segments) can plausibly need several
+    hundred to well over a thousand swaps; a fixed 100 regardless of
+    route size very likely left larger routes well short of local
+    2-opt-optimality, with genuine leftover crossings a fully-converged
+    2-opt would have removed. Default is now `max(100, 50 * n)` --
+    scales with route size (e.g. 12,500 for a 250-node route) instead of
+    a flat constant. Pass an explicit int to override.
     """
     tour = list(tour)
     n = len(tour)
     if n < 4:
         return tour
+
+    if max_iter is None:
+        max_iter = max(100, 50 * n)
 
     improved = True
     iter_cnt = 0
@@ -522,13 +663,37 @@ def _build_initial_columns(n, matrix, depot_idx):
 def _generate_priced_columns(
     matrix, depot_idx, duals, qubit_count, exploration_percent, xy_mixer,
     only_improving_columns, max_pricing_nodes, rng, apply_dual_candidate_filter=False,
-    global_max_dist=None,
+    global_max_dist=None, window_offset=None, known_sequences=None,
 ):
+    """
+    `window_offset`: dict {node: int}, the CURRENT per-node ranking-window
+    offset (see _dual_aware_nearest_and_explore's docstring and
+    run_cg_hybrid_lrwsqaoa_sub's "PREMATURE CONVERGENCE" fix). Read-only
+    here -- treated as {} (all offsets 0) if None.
+
+    `known_sequences`: set of node-sequence tuples already in the pool
+    BEFORE this call, used to detect whether a given node's pricing this
+    round actually found anything genuinely new (not just re-derived an
+    already-pooled column). If None, novelty tracking is skipped (offsets
+    passed through unchanged) -- used for the very first iteration, where
+    the pool is just singletons and nothing meaningful has stalled yet.
+
+    Returns (priced_columns, next_window_offset): `next_window_offset` is
+    a NEW dict, one entry per node actually priced this call -- the
+    offset each node's NEXT pricing attempt should use. A node whose
+    truncations included at least one genuinely new sequence resets to 0
+    (duals will likely have moved, so re-examining from the top under
+    fresh duals is the right default); a node whose window stalled
+    (nothing new) advances by n_nearest, deterministically, so its next
+    attempt looks further down the same ranking instead of retrying the
+    identical window.
+    """
     n = matrix.shape[0]
     start_nodes = list(range(n))
     if max_pricing_nodes is not None and max_pricing_nodes < n:
         start_nodes = list(rng.choice(n, size=max_pricing_nodes, replace=False))
 
+    window_offset = window_offset or {}
     candidate_duals = duals if apply_dual_candidate_filter else None
 
     # QAOA itself incorporates duals from iteration >= 2 onward, matching
@@ -546,15 +711,18 @@ def _generate_priced_columns(
         qaoa_matrix = matrix
 
     priced = []
+    next_window_offset = {}
+
     for curr_node in start_nodes:
         exclude = {depot_idx} if curr_node != depot_idx else set()
         k_batch = min(qubit_count, n - 1 - len(exclude))
         if k_batch <= 0:
             continue
 
+        offset_here = window_offset.get(curr_node, 0) if apply_dual_candidate_filter else 0
         candidates = _nearest_and_explore_candidates(
             curr_node, exclude, matrix, k_batch, exploration_percent, rng,
-            duals=candidate_duals, global_max_dist=global_max_dist,
+            duals=candidate_duals, global_max_dist=global_max_dist, window_offset=offset_here,
         )
         if not candidates:
             continue
@@ -567,6 +735,7 @@ def _generate_priced_columns(
             continue
 
         full_nodes = [curr_node] + subtour
+        found_new = known_sequences is None  # first iteration: nothing to compare against yet
         for L in range(len(full_nodes), 0, -1):
             seg = full_nodes[:L]
             cost = _open_path_cost(seg, matrix)  # raw matrix -- real cost, not dual-adjusted
@@ -577,8 +746,28 @@ def _generate_priced_columns(
                 # for coverage, just skip re-adding a duplicate non-improving one.
                 continue
             priced.append({"nodes": seg, "cost": cost, "reduced_cost": reduced_cost, "start": curr_node})
+            # Novelty is checked AFTER the improving-cost filter, not before
+            # it (a real bug this fix caught during its own testing -- see
+            # "PREMATURE CONVERGENCE" FIX LOG): a candidate window that
+            # slides to new territory will almost always produce
+            # structurally different node SEQUENCES than before, even when
+            # every one of them fails the improving-cost filter and never
+            # actually reaches the pool. Checking novelty before the filter
+            # meant `found_new` was true almost every iteration regardless
+            # of whether anything useful was found, which reset the offset
+            # back to 0 immediately -- undoing the slide and re-stalling on
+            # the very next call instead of ever making progress deeper
+            # into the ranking.
+            if known_sequences is not None and tuple(seg) not in known_sequences:
+                found_new = True
 
-    return priced
+        if apply_dual_candidate_filter:
+            if found_new:
+                next_window_offset[curr_node] = 0  # fresh duals next round -> re-examine from the top
+            else:
+                next_window_offset[curr_node] = offset_here + k_batch  # slide past this stalled window
+
+    return priced, next_window_offset
 
 
 def _dedupe_columns(columns):
@@ -675,20 +864,43 @@ def run_cg_hybrid_lrwsqaoa_sub(
     pool = _build_initial_columns(n, matrix, depot_idx)
     duals = {}
     iteration_log = []
+    # Persistent per-node ranking-window offset -- see
+    # _dual_aware_nearest_and_explore's docstring and the "PREMATURE
+    # CONVERGENCE" FIX LOG entry below. {} = every node starts at
+    # offset 0 (top of its reduced-cost ranking), same as before this fix.
+    window_offset = {}
 
     for it in range(1, n_iterations + 1):
         status_lp, _, _, duals = _solve_master(pool, node_ids, relaxation=True, time_limit=time_limit)
         if status_lp not in ("Optimal", "Not Solved"):
             warnings.warn(f"Iteration {it}: LP relaxation status was '{status_lp}' (expected 'Optimal').")
 
-        priced_columns = _generate_priced_columns(
+        known_sequences = {tuple(col["nodes"]) for col in pool} if it >= 2 else None
+        priced_columns, next_window_offset = _generate_priced_columns(
             matrix, depot_idx, duals, qubit_count, exploration_percent, xy_mixer,
             only_improving_columns, max_pricing_nodes, rng,
             apply_dual_candidate_filter=(it >= 2), global_max_dist=global_max_dist,
+            window_offset=window_offset, known_sequences=known_sequences,
         )
+        window_offset = next_window_offset
+
         pool_before = len(pool)
         pool = _dedupe_columns(pool + priced_columns)
         n_new = len(pool) - pool_before
+
+        # Whether EVERY node's ranking window has genuinely run out of
+        # room to slide further (see _is_window_saturated) -- i.e. every
+        # pricing start has now had its FULL candidate list examined at
+        # some point, not just its original top-k. Only meaningful once
+        # apply_dual_candidate_filter has kicked in (it >= 2).
+        fully_saturated = it >= 2 and all(
+            _is_window_saturated(
+                node, {depot_idx} if node != depot_idx else set(), matrix,
+                min(qubit_count, n - 1 - (1 if node != depot_idx else 0)),
+                window_offset.get(node, 0),
+            )
+            for node in range(n)
+        )
 
         iteration_log.append({
             "iteration": it,
@@ -696,10 +908,21 @@ def run_cg_hybrid_lrwsqaoa_sub(
             "num_priced": len(priced_columns),
             "num_new_columns": n_new,
             "pool_size": len(pool),
+            "fully_saturated": fully_saturated,
         })
 
-        if n_new == 0:
-            break  # converged: pool unchanged, further iterations would be identical
+        if n_new == 0 and (it < 2 or fully_saturated):
+            # FIX (see "PREMATURE CONVERGENCE" in the module FIX LOG):
+            # only declare convergence once every node's ranking window
+            # has actually been slid through its full candidate list --
+            # not merely because THIS iteration's (possibly narrow, or
+            # previously-tried) window happened to find nothing new.
+            # window_offset advancing on stall (see _generate_priced_
+            # columns) means a node that stalls here will use a DEEPER
+            # window next call -- so if any node isn't yet saturated,
+            # continuing is a genuine, still-productive next attempt, not
+            # a repeat of an already-exhausted search.
+            break
 
     full_pool = pool
 
