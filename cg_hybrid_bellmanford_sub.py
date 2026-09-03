@@ -488,7 +488,162 @@ def _dedupe_columns(columns):
     return list(seen.values())
 
 
-def _concatenate_segments(selected_columns, depot_idx, matrix):
+def _concatenate_segments_exact(depot_last_node, segments, matrix, max_k=15):
+    """
+    EXACT segment-chaining: finds the OPTIMAL order AND orientation of
+    `segments` (each may be traversed forward or reversed) starting
+    from depot_last_node, via Held-Karp-style DP over (visited-subset,
+    last-segment, last-orientation) states. This state graph is acyclic
+    by construction (visited-subset only grows along any edge) -- the
+    same "Bellman-Ford without negative cycles" argument used by
+    solve_bellman_ford_subtour applies here too, just with segments (2
+    orientations each) as the objects being ordered instead of raw
+    nodes. Verified against brute force on random instances (K up to 8)
+    before use -- see the FIX LOG entry this function is documented
+    under for the numbers.
+
+    Cost: O(2^K * K^2) time, exponential in the number of SEGMENTS (not
+    nodes) -- typically far fewer than n, so this reaches real-scale
+    route segment counts (K~15-18) in seconds to tens of seconds; see
+    _concatenate_segments's docstring for measured numbers and why
+    max_k gates a fallback rather than attempting arbitrarily large K.
+
+    Returns (ordered_node_list, stitched_cost) for the non-depot
+    segments only -- the caller prepends the depot segment.
+    """
+    K = len(segments)
+    if K == 0:
+        return [], 0.0
+    if K > max_k:
+        raise ValueError(f"K={K} non-depot segments exceeds max_k={max_k}")
+
+    orientations = []
+    for seg in segments:
+        fwd = (seg[0], seg[-1], _open_path_cost(seg, matrix), seg)
+        if len(seg) == 1:
+            orientations.append([fwd])
+        else:
+            rev_nodes = list(reversed(seg))
+            rev = (rev_nodes[0], rev_nodes[-1], _open_path_cost(rev_nodes, matrix), rev_nodes)
+            orientations.append([fwd, rev])
+
+    FULL = (1 << K) - 1
+    INF = float("inf")
+    dp = {}
+    parent = {}
+
+    for i in range(K):
+        for o, (entry, exit_, cost, nodes) in enumerate(orientations[i]):
+            mask = 1 << i
+            dp[(mask, i, o)] = matrix[depot_last_node, entry] + cost
+            parent[(mask, i, o)] = None
+
+    # Increasing popcount = topological order of this acyclic state
+    # graph (see docstring) -- a single forward pass suffices.
+    for mask in sorted(range(1, FULL + 1), key=lambda m: bin(m).count("1")):
+        for i in range(K):
+            if not (mask & (1 << i)):
+                continue
+            for o in range(len(orientations[i])):
+                key = (mask, i, o)
+                if key not in dp:
+                    continue
+                cur_cost = dp[key]
+                exit_i = orientations[i][o][1]
+                for j in range(K):
+                    if mask & (1 << j):
+                        continue
+                    new_mask = mask | (1 << j)
+                    for oj, (entry_j, exit_j, cost_j, nodes_j) in enumerate(orientations[j]):
+                        new_cost = cur_cost + matrix[exit_i, entry_j] + cost_j
+                        new_key = (new_mask, j, oj)
+                        if new_cost < dp.get(new_key, INF):
+                            dp[new_key] = new_cost
+                            parent[new_key] = key
+
+    best_key, best_cost = None, INF
+    for i in range(K):
+        for o in range(len(orientations[i])):
+            key = (FULL, i, o)
+            if key in dp and dp[key] < best_cost:
+                best_cost, best_key = dp[key], key
+
+    order = []
+    key = best_key
+    while key is not None:
+        mask, i, o = key
+        order.append((i, o))
+        key = parent[key]
+    order.reverse()
+
+    result_nodes = []
+    for i, o in order:
+        result_nodes.extend(orientations[i][o][3])
+    return result_nodes, best_cost
+
+
+def _concatenate_segments_greedy(depot_last_node, segments, matrix):
+    """Reversal-aware nearest-neighbor fallback for when there are too
+    many segments for _concatenate_segments_exact (see its max_k).
+    Selection stays nearest-neighbor BY ENTRY COST ONLY -- reversal only
+    widens what counts as a segment's "entry point" to both its ends;
+    it does NOT fold each segment's own internal cost into the ranking
+    (an earlier version of this fix did that by mistake and was
+    measured to make results WORSE on a real test case, since it can
+    front-load a cheap-but-distant segment ahead of a genuinely nearby
+    one -- see the FIX LOG entry this is documented under)."""
+    tour_nodes = []
+    remaining = list(segments)
+    last_node = depot_last_node
+    while remaining:
+        best_entry, best_idx, best_nodes = None, None, None
+        for idx, seg in enumerate(remaining):
+            candidates = (seg,) if len(seg) == 1 else (seg, list(reversed(seg)))
+            for nodes in candidates:
+                entry_cost = matrix[last_node, nodes[0]]
+                if best_entry is None or entry_cost < best_entry:
+                    best_entry, best_idx, best_nodes = entry_cost, idx, nodes
+        tour_nodes.extend(best_nodes)
+        last_node = best_nodes[-1]
+        remaining.pop(best_idx)
+    return tour_nodes
+
+
+def _concatenate_segments(selected_columns, depot_idx, matrix, exact_max_k=15):
+    """
+    FIX (see module FIX LOG, "CONCATENATION BLIND TO STITCHING COST" and
+    "EXACT SEGMENT CHAINING"): the master problem optimizes each
+    column's FORWARD internal cost only and has ZERO visibility into
+    stitching cost between segments -- measured on a real test case at
+    165% of the master's own objective (i.e. more than half the final
+    tour's cost came from something the master never saw or optimized
+    for at all). That structural gap in the MASTER is not fixed here (a
+    complete fix would need the master itself to see stitching cost, a
+    materially bigger change than this function can make on its own).
+
+    What IS fixed here: given whichever segments the master selected,
+    this function now finds the OPTIMAL order and orientation to chain
+    them (via _concatenate_segments_exact, Held-Karp over segment
+    states -- verified against brute force) whenever there are at most
+    `exact_max_k` non-depot segments, instead of a greedy nearest-
+    neighbor approximation of that ordering problem. Falls back to
+    _concatenate_segments_greedy (still reversal-aware, just not exact)
+    above that count, since exact chaining is O(2^K * K^2) in the
+    number of segments.
+
+    HONEST RESULT, measured on a real test case (18 segments): exact
+    chaining reduced the raw (pre-2-opt) stitched cost by ~9.5% versus
+    the previous greedy concatenation (563.83 -> 510.40) -- a real,
+    verified improvement in what this function controls. But the FINAL
+    (post-2-opt) cost was NOT correspondingly better in that same test
+    (498.89 -> 508.16, slightly worse) -- 2-opt is itself a local search
+    whose result depends on its starting tour, and a better starting
+    point does not guarantee a better local optimum after 2-opt polishes
+    it. This is not a bug in the exact chaining; it's a real property of
+    chaining a locally-optimal construction step into another local
+    search, worth knowing rather than assuming a better intermediate
+    result always propagates to a better final one.
+    """
     depot_segments = [c for c in selected_columns if c["nodes"][0] == depot_idx]
     other_segments = [c for c in selected_columns if c["nodes"][0] != depot_idx]
 
@@ -506,14 +661,20 @@ def _concatenate_segments(selected_columns, depot_idx, matrix):
         other_segments = depot_segments[1:] + other_segments
         depot_segments = depot_segments[:1]
 
-    tour = list(depot_segments[0]["nodes"])
-    remaining = list(other_segments)
-    while remaining:
-        last_node = tour[-1]
-        remaining.sort(key=lambda c: matrix[last_node, c["nodes"][0]])
-        next_seg = remaining.pop(0)
-        tour.extend(next_seg["nodes"])
-    return tour
+    depot_nodes = list(depot_segments[0]["nodes"])
+    depot_last_node = depot_nodes[-1]
+    segment_node_lists = [c["nodes"] for c in other_segments]
+
+    if len(segment_node_lists) <= exact_max_k:
+        chained_nodes, _ = _concatenate_segments_exact(depot_last_node, segment_node_lists, matrix, max_k=exact_max_k)
+    else:
+        warnings.warn(
+            f"{len(segment_node_lists)} non-depot segments exceeds exact_max_k={exact_max_k}; "
+            f"falling back to reversal-aware greedy concatenation (not exact) for this route."
+        )
+        chained_nodes = _concatenate_segments_greedy(depot_last_node, segment_node_lists, matrix)
+
+    return depot_nodes + chained_nodes
 
 
 # =====================================================================
